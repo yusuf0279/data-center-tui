@@ -161,6 +161,25 @@ def response_secs(role: int, level: int) -> int:
     return max(1, math.ceil(response_time(role, level)))
 
 
+def restore_site(site: int, income: int, bonus_pct: int) -> tuple[list[int], list[int]]:
+    """Rebuild a racks/chips layout worth about `income`. Older saves kept only a
+    closed data center's final income, so this gives it real servers back."""
+    owned = [0] * len(TIERS)
+    chips = [0] * len(TIERS)
+    remaining = income * 100 // (100 + bonus_pct)
+    for t in range(len(TIERS) - 1, -1, -1):
+        level, unit = 0, tier_income(t, 1, 0, site)
+        for level in range(MAX_CHIP + 1):
+            unit = tier_income(t, 1, level, site)
+            if remaining // unit <= MAX_OWNED:
+                break
+        n = min(MAX_OWNED, remaining // unit)
+        if n:
+            owned[t], chips[t] = n, level
+            remaining -= n * unit
+    return owned, chips
+
+
 # ------------------------------------------------------------------ helpers
 
 def save_path() -> Path:
@@ -408,6 +427,8 @@ class DataCenter(App):
         Binding("h", "view('staff')", "Crew"),
         Binding("d", "view('sites')", "Data centers"),
         Binding("x", "expand", "Expand"),
+        Binding("left_square_bracket", "site(-1)", "Older site", show=False),
+        Binding("right_square_bracket", "site(1)", "Newer site", show=False),
         Binding("f", "fix", "Fix"),
         Binding("q", "quit", "Quit"),
     ]
@@ -419,15 +440,32 @@ class DataCenter(App):
         self.balance = balance if type(balance) is int and 0 <= balance < MAX_BIG else 500
         sites = data.get("sites")
         self.sites = sites if type(sites) is int and 0 <= sites <= MAX_SITES else 0
-        self.legacy = [0] * self.sites  # final income of each finished data center
-        raw_legacy = data.get("legacy")
-        if isinstance(raw_legacy, list):
-            for i, v in enumerate(raw_legacy[:self.sites]):
-                if type(v) is int and 0 <= v < MAX_BIG:
-                    self.legacy[i] = v
-        self.owned = clean_levels(data.get("owned"), len(TIERS), 0, MAX_OWNED, 0)
-        self.chips = clean_levels(data.get("chips"), len(TIERS), 0, MAX_CHIP, 0)
         self.staff = clean_levels(data.get("staff"), len(STAFF), -1, MAX_STAFF, -1)
+        n = len(TIERS)
+        if isinstance(data.get("site_owned"), list):  # current format: every site has its own racks
+            so, sc = data["site_owned"], data.get("site_chips")
+            sc = sc if isinstance(sc, list) else []
+            self.site_owned = [clean_levels(so[k] if k < len(so) else None, n, 0, MAX_OWNED, 0)
+                               for k in range(self.sites + 1)]
+            self.site_chips = [clean_levels(sc[k] if k < len(sc) else None, n, 0, MAX_CHIP, 0)
+                               for k in range(self.sites + 1)]
+        else:  # older saves: finished data centers kept only their final income
+            legacy = [0] * self.sites
+            raw_legacy = data.get("legacy")
+            if isinstance(raw_legacy, list):
+                for i, v in enumerate(raw_legacy[:self.sites]):
+                    if type(v) is int and 0 <= v < MAX_BIG:
+                        legacy[i] = v
+            bonus = STAFF_BONUS * sum(level + 1 for level in self.staff if level >= 0)
+            self.site_owned, self.site_chips = [], []
+            for k in range(self.sites):
+                o, c = restore_site(k, legacy[k], bonus)
+                self.site_owned.append(o)
+                self.site_chips.append(c)
+            self.site_owned.append(clean_levels(data.get("owned"), n, 0, MAX_OWNED, 0))
+            self.site_chips.append(clean_levels(data.get("chips"), n, 0, MAX_CHIP, 0))
+        cur = data.get("cur")
+        self.cur = cur if type(cur) is int and 0 <= cur <= self.sites else self.sites
         theme = data.get("theme")
         self.saved_theme = theme if isinstance(theme, str) else DEFAULT_THEME
         self.side = "servers"
@@ -461,9 +499,9 @@ class DataCenter(App):
             path.parent.mkdir(parents=True, exist_ok=True)
             tmp = path.with_suffix(".tmp")
             tmp.write_text(json.dumps({
-                "balance": self.balance, "owned": self.owned, "chips": self.chips,
-                "staff": self.staff, "sites": self.sites, "legacy": self.legacy,
-                "theme": self.theme, "saved_at": time.time(),
+                "balance": self.balance, "site_owned": self.site_owned,
+                "site_chips": self.site_chips, "staff": self.staff, "sites": self.sites,
+                "cur": self.cur, "theme": self.theme, "saved_at": time.time(),
             }))
             os.replace(tmp, path)
         except OSError:
@@ -488,24 +526,36 @@ class DataCenter(App):
         return self._pal
 
     @property
-    def site_base(self) -> int:
-        """This data center's income before the crew bonus."""
-        return sum(tier_income(t, n, c, self.sites)
-                   for t, (n, c) in enumerate(zip(self.owned, self.chips)))
+    def owned(self) -> list[int]:
+        """Servers in the data center you are looking at."""
+        return self.site_owned[self.cur]
+
+    @property
+    def chips(self) -> list[int]:
+        return self.site_chips[self.cur]
+
+    def raw_income(self, k: int) -> int:
+        """Data center k's income before the crew bonus."""
+        return sum(tier_income(t, n, c, k)
+                   for t, (n, c) in enumerate(zip(self.site_owned[k], self.site_chips[k])))
+
+    @property
+    def total_base(self) -> int:
+        """All data centers together, before the crew bonus."""
+        return sum(self.raw_income(k) for k in range(self.sites + 1))
 
     @property
     def staff_bonus(self) -> int:
         """Percent income bonus from the crew."""
         return STAFF_BONUS * sum(level + 1 for level in self.staff if level >= 0)
 
-    @property
-    def site_income(self) -> int:
-        return self.site_base * (100 + self.staff_bonus) // 100
+    def site_income(self, k: int) -> int:
+        return self.raw_income(k) * (100 + self.staff_bonus) // 100
 
     @property
     def base_income(self) -> int:
         """Everything earning right now, ignoring any crisis."""
-        return self.site_income + sum(self.legacy)
+        return self.total_base * (100 + self.staff_bonus) // 100
 
     @property
     def income(self) -> int:
@@ -526,7 +576,7 @@ class DataCenter(App):
                 yield Static(id="stats", classes="card")
                 yield Static(id="shop", classes="card")
         yield Static(id="alert")
-        yield Static("1-6 pick  s c h d views  x expand  f fix  ctrl+p theme  q quit",
+        yield Static("1-6 pick  s c h d views  [ ] site  x expand  f fix  ctrl+p theme  q quit",
                      id="hint")
 
     def on_mount(self) -> None:
@@ -597,7 +647,7 @@ class DataCenter(App):
         sevs = [1]
         if sum(self.owned) >= 5 or self.sites > 0:
             sevs.append(2)
-        if self.sites > 0 or self.site_base >= 200:
+        if self.sites > 0 or self.total_base >= 200:
             sevs.append(3)
         sev = self.rng.choices(sevs, [CRISIS_WEIGHT[s] for s in sevs])[0]
         title = self.rng.choice(CRISES[sev])
@@ -632,6 +682,11 @@ class DataCenter(App):
         if self.side == "servers":
             self.action_buy(i)
             return
+        if self.side == "sites":  # row 1 is the newest data center
+            if 0 <= self.sites - i <= self.sites:
+                self.side = "servers"
+                self.goto_site(self.sites - i)
+            return
         if self.side == "chips":
             self.buy_chip(i)
         elif self.side == "staff" and i < len(STAFF):
@@ -640,7 +695,7 @@ class DataCenter(App):
         self.save()
 
     def action_buy(self, tier: int) -> None:
-        p, cost = self.pal, cost_of(tier, self.owned[tier], self.sites)
+        p, cost = self.pal, cost_of(tier, self.owned[tier], self.cur)
         if self.owned[tier] >= MAX_OWNED:
             self.say(f"{TIERS[tier][0]}: that's enough, truly", p.muted)
         elif self.balance >= cost:
@@ -657,7 +712,7 @@ class DataCenter(App):
         if level >= MAX_CHIP:
             self.say(f"{TIERS[tier][0]} chips are maxed out", p.muted)
             return
-        cost = chip_cost(tier, level, self.sites)
+        cost = chip_cost(tier, level, self.cur)
         if self.owned[tier] == 0:
             self.say(f"! buy a {TIERS[tier][0]} first", p.error)
         elif self.balance < cost:
@@ -695,16 +750,27 @@ class DataCenter(App):
             self.say(f"! need ${fmt(cost)} to open {site_name(self.sites + 1)}", p.error)
         else:
             self.balance -= cost
-            self.legacy.append(self.site_income)
             self.sites += 1
-            self.owned = [0] * len(TIERS)
-            self.chips = [0] * len(TIERS)
+            self.site_owned.append([0] * len(TIERS))
+            self.site_chips.append([0] * len(TIERS))
+            self.cur = self.sites
             self.crisis = None
             self.side = "servers"
-            self.say(f"★ Opened {site_name(self.sites)}! {site_name(self.sites - 1)} keeps "
-                     f"earning ${fmt(self.legacy[-1])}/s", p.success)
+            self.say(f"★ Opened {site_name(self.sites)}! The older ones keep earning "
+                     f"(press d to visit them)", p.success)
         self.redraw()
         self.save()
+
+    def goto_site(self, k: int) -> None:
+        if 0 <= k <= self.sites and k != self.cur:
+            self.cur = k
+            self.say(f"Now at #{k + 1} {site_name(k)}", self.pal.muted)
+        self.redraw()
+        self.save()
+
+    def action_site(self, delta: int) -> None:
+        """[ and ] step to the older / newer data center."""
+        self.goto_site(self.cur + delta)
 
     # -- drawing -----------------------------------------------------------
 
@@ -757,8 +823,8 @@ class DataCenter(App):
             self.set_text("#alert", Text(
                 f"⚠ {c['title']}  ·  income -{100 - num * 100 // den}%  ·  {who}"))
 
-        self.set_title("#hall", f"{site_name(self.sites)} · {sum(self.owned)} racks")
-        sig = (tuple(self.owned), self.crisis is not None, id(p),
+        self.set_title("#hall", f"#{self.cur + 1} {site_name(self.cur)} · {sum(self.owned)} racks")
+        sig = (self.cur, tuple(self.owned), self.crisis is not None, id(p),
                self.phase // LED_PERIOD if sum(self.owned) else 0)
         if sig != self._hall_sig:  # a static hall costs nothing to leave alone
             self._hall_sig = sig
@@ -774,7 +840,7 @@ class DataCenter(App):
     def servers_text(self) -> Text:
         p, shop = self.pal, Text()
         for i, (name, _, inc) in enumerate(TIERS):
-            cost = cost_of(i, self.owned[i], self.sites)
+            cost = cost_of(i, self.owned[i], self.cur)
             ok = self.balance >= cost
             accent = rgb(p.tiers[i]) if ok else rgb(p.muted)
             self.row(shop, i + 1, name, f"x{self.owned[i]}", accent,
@@ -782,7 +848,7 @@ class DataCenter(App):
                      rgb(p.fg) if self.owned[i] else rgb(p.faint))
             shop.append("     ")
             shop.append(f"${fmt(cost)}", f"bold {rgb(p.success)}" if ok else rgb(p.error))
-            each = tier_income(i, 1, self.chips[i], self.sites)
+            each = tier_income(i, 1, self.chips[i], self.cur)
             shop.append(f"  ·  +${fmt(each)}/s\n", rgb(p.muted))
         return shop
 
@@ -792,7 +858,7 @@ class DataCenter(App):
             level = self.chips[i]
             maxed = level >= MAX_CHIP
             name = chip_name(i, min(level, MAX_CHIP - 1))
-            cost = 0 if maxed else chip_cost(i, level, self.sites)
+            cost = 0 if maxed else chip_cost(i, level, self.cur)
             ok = not maxed and self.owned[i] > 0 and self.balance >= cost
             accent = rgb(p.tiers[i]) if ok else rgb(p.muted)
             self.row(shop, i + 1, name, "MAX" if maxed else f"L{level}", accent,
@@ -834,18 +900,19 @@ class DataCenter(App):
         return shop
 
     def sites_text(self) -> Text:
-        p, t, cur = self.pal, Text(), self.sites
-        t.append("▶ ", f"bold {rgb(p.success)}")
-        t.append(f"#{cur + 1} {site_name(cur)}\n", f"bold {rgb(p.primary)}")
-        t.append(f"    ${fmt(self.site_income)}/s  ·  {sum(self.owned)} racks\n", rgb(p.muted))
-        for k in range(cur - 1, max(-1, cur - 6), -1):
-            nm = f"#{k + 1} {site_name(k)}"[:30]
-            inc = f"${fmt(self.legacy[k] if k < len(self.legacy) else 0)}/s"
-            t.append(f"  {nm}", rgb(p.fg))
-            t.append(" " * max(1, ROW_W - 2 - len(nm) - len(inc)))
+        p, t, cur = self.pal, Text(), self.sites  # cur = the newest data center
+        for row, k in enumerate(range(cur, max(-1, cur - 6), -1)):  # keys 1-6, newest first
+            here = k == self.cur
+            inc = f"${fmt(self.site_income(k))}/s"
+            nm = f"#{k + 1} {site_name(k)}"[:ROW_W - 6 - len(inc)]  # only cut what must be cut
+            chip = rgb(p.success) if here else rgb(p.muted)
+            t.append(f" {row + 1} ", f"bold {rgb(p.chip_text)} on {chip}")
+            t.append(" ▶" if here else "  ", f"bold {rgb(p.success)}")
+            t.append(nm, f"bold {rgb(p.primary)}" if here else rgb(p.fg))
+            t.append(" " * max(1, ROW_W - 5 - len(nm) - len(inc)))
             t.append(inc + "\n", rgb(p.warning))
-        if cur > 6:
-            t.append(f"  ... and {cur - 6} older\n", rgb(p.faint))
+        if cur > 5:
+            t.append(f"     ... {cur - 5} older: use [ and ] to visit\n", rgb(p.faint))
         t.append("\n")
         if cur >= MAX_SITES:
             t.append("You own the multiverse.\n", rgb(p.success))
