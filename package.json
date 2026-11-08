@@ -1,0 +1,11 @@
+{
+  "name": "data-center-tui",
+  "private": true,
+  "description": "Web version, VS Code extension and browser extension for My Data Center",
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "test": "node --test web/test/",
+    "package:browser": "node scripts/build.mjs --zip",
+    "package:vscode": "node scripts/build.mjs && cd vscode && npx --yes @vscode/vsce package --allow-missing-repository --skip-license"
+  }
+}

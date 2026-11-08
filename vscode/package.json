@@ -1,0 +1,22 @@
+{
+  "name": "my-data-center",
+  "displayName": "My Data Center",
+  "description": "A pixel-art idle tycoon for the editor. Buy servers, hire Vibecoders, survive crises, open ever-bigger data centers while your AI works.",
+  "version": "0.1.0",
+  "publisher": "yusuf0279",
+  "engines": { "vscode": "^1.85.0" },
+  "categories": ["Other"],
+  "keywords": ["game", "idle", "tycoon", "clicker"],
+  "icon": "icon.png",
+  "main": "./extension.js",
+  "activationEvents": ["onStartupFinished"],
+  "contributes": {
+    "commands": [
+      {
+        "command": "dataCenter.open",
+        "title": "Play",
+        "category": "Data Center"
+      }
+    ]
+  }
+}
