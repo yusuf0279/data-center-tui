@@ -790,10 +790,11 @@ class DataCenter(App):
         if self.side == "servers":
             self.action_buy(i)
             return
-        if self.side == "sites":  # row 1 is the newest data center
-            if 0 <= self.sites - i <= self.sites:
+        if self.side == "sites":  # key N opens data center #N (page 2 shows #7-#12, ...)
+            k = self.cur // 6 * 6 + i
+            if k <= self.sites:
                 self.side = "servers"
-                self.goto_site(self.sites - i)
+                self.goto_site(k)
             return
         if self.side == "chips":
             self.buy_chip(i)
@@ -1039,7 +1040,8 @@ class DataCenter(App):
 
     def sites_text(self) -> Text:
         p, t, newest = self.pal, Text(), self.sites
-        for row, k in enumerate(range(newest, max(-1, newest - 6), -1)):  # keys 1-6, newest first
+        first = self.cur // 6 * 6  # six per page; the page follows the one you are in
+        for row, k in enumerate(range(first, min(first + 6, newest + 1))):  # keys 1-6, oldest first
             here = k == self.cur
             inc = f"${fmt(self.site_income(k))}/s"
             nm, room = f"#{k + 1} {site_name(k)}", ROW_W - 6 - len(inc)
@@ -1052,7 +1054,8 @@ class DataCenter(App):
             t.append(" " * max(1, ROW_W - 5 - len(nm) - len(inc)))
             t.append(inc + "\n", rgb(p.warning) if here else rgb(p.faint))
         if newest > 5:
-            t.append(f"     ... {newest - 5} older: use [ and ] to visit\n", rgb(p.faint))
+            t.append(f"     #{first + 1}-{min(first + 6, newest + 1)} of {newest + 1}"
+                     f"  ·  [ ] to move\n", rgb(p.faint))
         t.append("Only the one you are in earns.\n", rgb(p.faint))
         if newest >= MAX_SITES:
             t.append("You own the multiverse.\n", rgb(p.success))
