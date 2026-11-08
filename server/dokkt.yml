@@ -1,0 +1,25 @@
+app: data-center-leaderboard
+services:
+  - name: web
+    kind: web
+    build:
+      context: .
+      dockerfile: Dockerfile
+    public: true
+    ports:
+      - container: 8080
+        host: 0
+    volumes:
+      - source: leaderboard-data
+        target: /data
+    health:
+      path: /health
+      initial_delay: 3s
+      interval: 10s
+      timeout: 3s
+      retries: 10
+resources:
+  memory: 128m
+  cpus: "0.25"
+domains:
+  - data-center.openexplorer.xyz
