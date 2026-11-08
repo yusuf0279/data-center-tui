@@ -24,19 +24,26 @@ RGB = tuple[int, int, int]
 
 # ---------------------------------------------------------------- game data
 
-# name, base cost, income/sec (for the first data center)
+# name, base cost, income/sec (for the first data center).
+# Cost = income x payback seconds, and payback doubles every tier (30s, 60s ... 960s):
+# cheap tiers pay back fast, expensive ones are long-term bets, so every tier has its moment.
 TIERS: list[tuple[str, int, int]] = [
-    ("Budget VPS", 100, 2),
-    ("Compute Node", 600, 14),
-    ("GPU Cluster", 3000, 80),
-    ("AI Datacenter", 15000, 450),
-    ("Quantum Farm", 80000, 2500),
-    ("Orbital Cloud", 400000, 15000),
+    ("Budget VPS", 60, 2),
+    ("Compute Node", 840, 14),
+    ("GPU Cluster", 9_600, 80),
+    ("AI Datacenter", 108_000, 450),
+    ("Quantum Farm", 1_200_000, 2500),
+    ("Orbital Cloud", 14_400_000, 15000),
 ]
+# Each extra copy of a tier costs this many percent of the previous one (107 = +7%).
+# Gentle everywhere, a little steeper for the big tiers, so you keep buying all six.
+GROWTH_PCT = [107, 108, 109, 110, 111, 112]
+# Owning this many of a tier doubles that tier's income (like Cash Inc's milestones).
+MILESTONES = [25, 50, 100, 200, 300, 400, 500, 1000, 1500, 2000, 3000, 4000]
 MAX_OWNED = 4000  # per tier; keeps costs finite
 
 # Chip upgrades: 20 levels per tier = 5 families x 4 editions. Each level doubles
-# that tier's income and costs 3x the previous level.
+# that tier's income and costs 4x the previous level.
 CHIP_FAMILIES: list[list[str]] = [
     ["GT 1030", "RX 6400", "Vega 8 (Hopeful)", "GTX 750", "Radeon HD 7000"],
     ["Ryzen 5 5600", "Ryzen 9 Zen Garden", "Threadripper 3990", "EPYC Milan", "Ryzen Z Handheld"],
@@ -47,8 +54,9 @@ CHIP_FAMILIES: list[list[str]] = [
 ]
 CHIP_EDITIONS = ["", " Ti", " Super", " Ultra Max"]
 MAX_CHIP = 20
-CHIP_BASE = 20  # level-0 chip costs this many times the tier's base cost
-CHIP_GROWTH = 3
+CHIP_BASE = 2  # level-0 chip costs this many times the tier's base cost
+CHIP_GROWTH = 4  # each level costs 4x the one before (x2 income): steep enough that
+#                  milestones and buying more servers stay worth it
 CHIP_BOOST = 2
 
 # On-call crew: name, hire cost, tagline, highest crisis severity handled, base response (s)
@@ -65,18 +73,30 @@ MAX_STAFF = 10  # training levels after hiring
 RESPONSE_DECAY = 0.8  # response time multiplier per level
 STAFF_BONUS = 5  # percent income per level, counting the hire as level 1
 
-# Data centers: reach the threshold to open the next one. The old one keeps earning.
+# Data centers: reach the threshold in your newest one to relocate. You start from
+# scratch in the next one (money, servers, chips and crew reset); you keep Fame and
+# your status. Old data centers are frozen: you can visit them, but only the one you
+# are in earns.
 SITE_NAMES = [
     "Garage in Palo Alto", "Abandoned Mall in Ohio", "Decommissioned Missile Silo",
     "Arctic Bunker (free cooling)", "Undersea Pod off Iceland", "Lunar Regolith Campus",
     "Dyson Swarm Annex", "Pocket Universe", "Heat Death Colo",
     "The Cloud (Actually Water Vapor)",
 ]
-EXPAND_BASE = 10**9  # cost to open data center #2
-EXPAND_SCALE = 1000  # each later one needs 1000x more
+EXPAND_BASE = 10**13  # money needed in data center #1 to relocate
+EXPAND_SCALE = 1000  # each later data center needs 1000x more
 INCOME_SCALE = 1000  # tier income multiplier per data center
-COST_SCALE = 2500  # tier/chip/crew cost multiplier per data center
+COST_SCALE = 1250  # tier/chip/crew cost and starting money multiplier per data center
+START_BALANCE = 500
 MAX_SITES = 60
+FAME_BONUS = 2  # percent income per Fame point, in every data center
+# Status ladder: lifetime Fame needed for each title. Past the last one the title gets a
+# numeral and each next level needs double the Fame ("Tech Overlord II", "III", ...).
+RANKS: list[tuple[int, str]] = [
+    (0, "Nobody"), (1, "Intern"), (3, "Junior Dev"), (6, "Senior Dev"), (10, "Tech Lead"),
+    (15, "Engineering Manager"), (25, "Director"), (40, "VP of Engineering"), (60, "CTO"),
+    (90, "Tech CEO"), (130, "Tech Billionaire"), (180, "Tech Overlord"),
+]
 MAX_BIG = 10**600  # sanity bound for numbers read from a save file
 
 # Crises: severity -> titles. Income multiplier (num, den) while one is active.
@@ -132,11 +152,55 @@ def expand_cost(site: int) -> int:
 
 
 def cost_of(tier: int, owned: int, site: int = 0) -> int:
-    return TIERS[tier][1] * COST_SCALE**site * 115**owned // 100**owned
+    return TIERS[tier][1] * COST_SCALE**site * GROWTH_PCT[tier]**owned // 100**owned
+
+
+def milestone_mult(owned: int) -> int:
+    """Income multiplier from owning enough of a tier (x2 per milestone passed)."""
+    return 2 ** sum(1 for m in MILESTONES if owned >= m)
+
+
+def next_milestone(owned: int) -> int | None:
+    return next((m for m in MILESTONES if owned < m), None)
 
 
 def tier_income(tier: int, owned: int, chip: int, site: int = 0) -> int:
-    return owned * TIERS[tier][2] * INCOME_SCALE**site * CHIP_BOOST**chip
+    return (owned * TIERS[tier][2] * INCOME_SCALE**site * CHIP_BOOST**chip
+            * milestone_mult(owned))
+
+
+def start_balance(site: int) -> int:
+    return START_BALANCE * COST_SCALE**site
+
+
+def fame_gain(balance: int, site: int) -> int:
+    """Fame for relocating out of data center `site` holding `balance`: 1 at the
+    threshold, then growing with the square root of how far past it you got."""
+    return math.isqrt(balance // expand_cost(site))
+
+
+def roman(n: int) -> str:
+    out = ""
+    for value, symbol in ((1000, "M"), (900, "CM"), (500, "D"), (400, "CD"), (100, "C"),
+                          (90, "XC"), (50, "L"), (40, "XL"), (10, "X"), (9, "IX"),
+                          (5, "V"), (4, "IV"), (1, "I")):
+        while n >= value:
+            out += symbol
+            n -= value
+    return out
+
+
+def rank_of(fame: int) -> tuple[str, int, str]:
+    """(current title, Fame needed for the next title, next title)."""
+    i = max(j for j, (need, _) in enumerate(RANKS) if fame >= need)
+    if i + 1 < len(RANKS):
+        return RANKS[i][1], RANKS[i + 1][0], RANKS[i + 1][1]
+    top, name = RANKS[-1]
+    level = 1  # "Tech Overlord" is level 1; each doubling of Fame adds one
+    while fame >= top * 2**level and level < 3999:
+        level += 1
+    title = name if level == 1 else f"{name} {roman(level)}"
+    return title, top * 2**level, f"{name} {roman(level + 1)}"
 
 
 def chip_name(tier: int, level: int) -> str:
@@ -168,15 +232,20 @@ def restore_site(site: int, income: int, bonus_pct: int) -> tuple[list[int], lis
     chips = [0] * len(TIERS)
     remaining = income * 100 // (100 + bonus_pct)
     for t in range(len(TIERS) - 1, -1, -1):
-        level, unit = 0, tier_income(t, 1, 0, site)
-        for level in range(MAX_CHIP + 1):
-            unit = tier_income(t, 1, level, site)
-            if remaining // unit <= MAX_OWNED:
+        level = 0
+        for level in range(MAX_CHIP + 1):  # fewest chips that still keep the count in range
+            if tier_income(t, MAX_OWNED, level, site) > remaining:
                 break
-        n = min(MAX_OWNED, remaining // unit)
-        if n:
-            owned[t], chips[t] = n, level
-            remaining -= n * unit
+        lo, hi = 0, MAX_OWNED  # largest count whose income does not exceed what is left
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if tier_income(t, mid, level, site) <= remaining:
+                lo = mid
+            else:
+                hi = mid - 1
+        if lo:
+            owned[t], chips[t] = lo, level
+            remaining -= tier_income(t, lo, level, site)
     return owned, chips
 
 
@@ -426,9 +495,9 @@ class DataCenter(App):
         Binding("c", "view('chips')", "Chips"),
         Binding("h", "view('staff')", "Crew"),
         Binding("d", "view('sites')", "Data centers"),
-        Binding("x", "expand", "Expand"),
-        Binding("left_square_bracket", "site(-1)", "Older site", show=False),
-        Binding("right_square_bracket", "site(1)", "Newer site", show=False),
+        Binding("x", "expand", "Relocate"),
+        Binding("left_square_bracket", "site(-1)", "Older data center", show=False),
+        Binding("right_square_bracket", "site(1)", "Newer data center", show=False),
         Binding("f", "fix", "Fix"),
         Binding("q", "quit", "Quit"),
     ]
@@ -436,12 +505,14 @@ class DataCenter(App):
     def __init__(self) -> None:
         super().__init__()
         data = load_save()
-        balance = data.get("balance")
-        self.balance = balance if type(balance) is int and 0 <= balance < MAX_BIG else 500
         sites = data.get("sites")
         self.sites = sites if type(sites) is int and 0 <= sites <= MAX_SITES else 0
-        self.staff = clean_levels(data.get("staff"), len(STAFF), -1, MAX_STAFF, -1)
         n = len(TIERS)
+        # Saves from before data centers reset had ONE shared balance and crew.
+        old_balance = data.get("balance")
+        old_balance = (old_balance if type(old_balance) is int and 0 <= old_balance < MAX_BIG
+                       else START_BALANCE)
+        old_staff = clean_levels(data.get("staff"), len(STAFF), -1, MAX_STAFF, -1)
         if isinstance(data.get("site_owned"), list):  # current format: every site has its own racks
             so, sc = data["site_owned"], data.get("site_chips")
             sc = sc if isinstance(sc, list) else []
@@ -456,7 +527,7 @@ class DataCenter(App):
                 for i, v in enumerate(raw_legacy[:self.sites]):
                     if type(v) is int and 0 <= v < MAX_BIG:
                         legacy[i] = v
-            bonus = STAFF_BONUS * sum(level + 1 for level in self.staff if level >= 0)
+            bonus = STAFF_BONUS * sum(level + 1 for level in old_staff if level >= 0)
             self.site_owned, self.site_chips = [], []
             for k in range(self.sites):
                 o, c = restore_site(k, legacy[k], bonus)
@@ -466,6 +537,23 @@ class DataCenter(App):
             self.site_chips.append(clean_levels(data.get("chips"), n, 0, MAX_CHIP, 0))
         cur = data.get("cur")
         self.cur = cur if type(cur) is int and 0 <= cur <= self.sites else self.sites
+        # Every data center has its own money and crew, and only the one you are in earns.
+        fame = data.get("fame")
+        if isinstance(data.get("site_balance"), list):
+            sb, ss = data["site_balance"], data.get("site_staff")
+            ss = ss if isinstance(ss, list) else []
+            self.site_balance = [
+                sb[k] if k < len(sb) and type(sb[k]) is int and 0 <= sb[k] < MAX_BIG
+                else start_balance(k) for k in range(self.sites + 1)]
+            self.site_staff = [
+                clean_levels(ss[k] if k < len(ss) else None, len(STAFF), -1, MAX_STAFF, -1)
+                for k in range(self.sites + 1)]
+            default_fame = 0
+        else:  # migrate: the money and crew you had belong to your newest data center
+            self.site_balance = [0] * self.sites + [old_balance]
+            self.site_staff = ([[-1] * len(STAFF) for _ in range(self.sites)] + [old_staff])
+            default_fame = self.sites  # each data center you already opened counts as one Fame
+        self.fame = fame if type(fame) is int and 0 <= fame < MAX_BIG else default_fame
         theme = data.get("theme")
         self.saved_theme = theme if isinstance(theme, str) else DEFAULT_THEME
         self.side = "servers"
@@ -499,9 +587,10 @@ class DataCenter(App):
             path.parent.mkdir(parents=True, exist_ok=True)
             tmp = path.with_suffix(".tmp")
             tmp.write_text(json.dumps({
-                "balance": self.balance, "site_owned": self.site_owned,
-                "site_chips": self.site_chips, "staff": self.staff, "sites": self.sites,
-                "cur": self.cur, "theme": self.theme, "saved_at": time.time(),
+                "site_balance": self.site_balance, "site_owned": self.site_owned,
+                "site_chips": self.site_chips, "site_staff": self.site_staff,
+                "fame": self.fame, "sites": self.sites, "cur": self.cur,
+                "theme": self.theme, "saved_at": time.time(),
             }))
             os.replace(tmp, path)
         except OSError:
@@ -525,37 +614,54 @@ class DataCenter(App):
                 self._pal = Palette(theme.to_color_system().generate(), theme.dark)
         return self._pal
 
+    # Everything below belongs to the data center you are in (self.cur).
+
+    @property
+    def balance(self) -> int:
+        return self.site_balance[self.cur]
+
+    @balance.setter
+    def balance(self, value: int) -> None:
+        self.site_balance[self.cur] = value
+
     @property
     def owned(self) -> list[int]:
-        """Servers in the data center you are looking at."""
         return self.site_owned[self.cur]
 
     @property
     def chips(self) -> list[int]:
         return self.site_chips[self.cur]
 
+    @property
+    def staff(self) -> list[int]:
+        return self.site_staff[self.cur]
+
     def raw_income(self, k: int) -> int:
-        """Data center k's income before the crew bonus."""
+        """Data center k's income before the crew and Fame bonuses."""
         return sum(tier_income(t, n, c, k)
                    for t, (n, c) in enumerate(zip(self.site_owned[k], self.site_chips[k])))
 
-    @property
-    def total_base(self) -> int:
-        """All data centers together, before the crew bonus."""
-        return sum(self.raw_income(k) for k in range(self.sites + 1))
+    def crew_bonus(self, k: int) -> int:
+        """Percent income bonus from data center k's crew."""
+        return STAFF_BONUS * sum(level + 1 for level in self.site_staff[k] if level >= 0)
 
     @property
     def staff_bonus(self) -> int:
-        """Percent income bonus from the crew."""
-        return STAFF_BONUS * sum(level + 1 for level in self.staff if level >= 0)
+        return self.crew_bonus(self.cur)
+
+    @property
+    def fame_bonus(self) -> int:
+        return FAME_BONUS * self.fame
 
     def site_income(self, k: int) -> int:
-        return self.raw_income(k) * (100 + self.staff_bonus) // 100
+        """What data center k earns per second while you are in it."""
+        return (self.raw_income(k) * (100 + self.crew_bonus(k)) // 100
+                * (100 + self.fame_bonus) // 100)
 
     @property
     def base_income(self) -> int:
-        """Everything earning right now, ignoring any crisis."""
-        return self.total_base * (100 + self.staff_bonus) // 100
+        """What you earn right now (only the data center you are in), ignoring crises."""
+        return self.site_income(self.cur)
 
     @property
     def income(self) -> int:
@@ -571,12 +677,13 @@ class DataCenter(App):
         with Horizontal(id="main"):
             with Vertical(id="left"):
                 yield Hall(id="hall", classes="card")
-                yield RichLog(id="log", classes="card", markup=False)
+                # min_width defaults to 78, which would clip long lines instead of wrapping
+                yield RichLog(id="log", classes="card", markup=False, wrap=True, min_width=20)
             with Vertical(id="side"):
                 yield Static(id="stats", classes="card")
                 yield Static(id="shop", classes="card")
         yield Static(id="alert")
-        yield Static("1-6 pick  s c h d views  [ ] site  x expand  f fix  ctrl+p theme  q quit",
+        yield Static("1-6 pick  s c h d views  [ ] visit  x relocate  f fix  ctrl+p theme  q quit",
                      id="hint")
 
     def on_mount(self) -> None:
@@ -639,15 +746,16 @@ class DataCenter(App):
                 if c["eta"] <= 0:
                     self.resolve(c["fixer"])
             return
-        if (self.base_income >= CRISIS_MIN_INCOME
+        unit = INCOME_SCALE**self.cur  # crisis rules are relative to this data center's size
+        if (self.base_income >= CRISIS_MIN_INCOME * unit
                 and self.rng.random() < 1 / CRISIS_MEAN):
             self.spawn_crisis()
 
     def spawn_crisis(self) -> None:
         sevs = [1]
-        if sum(self.owned) >= 5 or self.sites > 0:
+        if sum(self.owned) >= 5:
             sevs.append(2)
-        if self.sites > 0 or self.total_base >= 200:
+        if self.raw_income(self.cur) >= 200 * INCOME_SCALE**self.cur:
             sevs.append(3)
         sev = self.rng.choices(sevs, [CRISIS_WEIGHT[s] for s in sevs])[0]
         title = self.rng.choice(CRISES[sev])
@@ -729,7 +837,7 @@ class DataCenter(App):
         if level >= MAX_STAFF:
             self.say(f"{name} is already a 10x legend", p.muted)
             return
-        cost = staff_cost(role, level, self.sites)
+        cost = staff_cost(role, level, self.cur)
         if self.balance < cost:
             self.say(f"! need ${fmt(cost)} for the {name}", p.error)
             return
@@ -746,24 +854,37 @@ class DataCenter(App):
             self.say("You own the multiverse. For now.", p.muted)
             return
         cost = expand_cost(self.sites)
-        if self.balance < cost:
-            self.say(f"! need ${fmt(cost)} to open {site_name(self.sites + 1)}", p.error)
+        if self.cur != self.sites:
+            self.say(f"! relocate from your newest data center (press ] to go to "
+                     f"#{self.sites + 1})", p.error)
+        elif self.balance < cost:
+            self.say(f"! need ${fmt(cost)} to relocate to {site_name(self.sites + 1)}", p.error)
         else:
-            self.balance -= cost
+            # Prestige: this data center is frozen as it is, and you start the next from
+            # scratch (money, servers, chips, crew). Fame and status carry over.
+            gain = fame_gain(self.balance, self.sites)
+            before = rank_of(self.fame)[0]
+            self.fame += gain
             self.sites += 1
             self.site_owned.append([0] * len(TIERS))
             self.site_chips.append([0] * len(TIERS))
+            self.site_balance.append(start_balance(self.sites))
+            self.site_staff.append([-1] * len(STAFF))
             self.cur = self.sites
             self.crisis = None
             self.side = "servers"
-            self.say(f"★ Opened {site_name(self.sites)}! The older ones keep earning "
-                     f"(press d to visit them)", p.success)
+            self.say(f"★ Relocated to {site_name(self.sites)}! +{fmt(gain)} Fame "
+                     f"(+{fmt(FAME_BONUS * gain)}% income)", p.success)
+            after = rank_of(self.fame)[0]
+            if after != before:
+                self.say(f"★ Promoted: {after}!", p.warning)
         self.redraw()
         self.save()
 
     def goto_site(self, k: int) -> None:
         if 0 <= k <= self.sites and k != self.cur:
             self.cur = k
+            self.crisis = None  # a crisis belongs to the data center it happened in
             self.say(f"Now at #{k + 1} {site_name(k)}", self.pal.muted)
         self.redraw()
         self.save()
@@ -791,18 +912,33 @@ class DataCenter(App):
         p = self.pal
         self.set_text("#cash", Text.assemble(("$ ", rgb(p.muted)), fmt(self.balance)))
 
+        rank, rank_need, _ = rank_of(self.fame)
+        self.set_text("#title", Text.assemble(
+            "◆ MY DATA CENTER", ("  ·  ", rgb(p.muted)), (rank, f"bold {rgb(p.success)}")))
+
         stats = Text()
         stats.append("Income  ", rgb(p.muted))
         stats.append(f"${fmt(self.income)}/s", f"bold {rgb(p.error if self.crisis else p.warning)}")
         stats.append("  (crisis)\n" if self.crisis else "\n", rgb(p.error))
         stats.append("Racks   ", rgb(p.muted))
-        stats.append(f"{sum(self.owned)}\n", f"bold {rgb(p.primary)}")
+        stats.append(f"{sum(self.owned):<8}", f"bold {rgb(p.primary)}")
+        stats.append("Fame ", rgb(p.muted))
+        stats.append(fmt(self.fame), f"bold {rgb(p.warning)}")
+        bonus = f" (+{fmt(self.fame_bonus)}%)"
+        if len(f"Racks   {sum(self.owned):<8}Fame {fmt(self.fame)}{bonus}") <= ROW_W:
+            stats.append(bonus, rgb(p.muted))  # dropped rather than wrapped
+        stats.append("\n")
         stats.append("Fleet   ", rgb(p.muted))
         for n, colour in zip(self.owned, p.tiers):
             stats.append("■ ", rgb(colour) if n else rgb(p.faint))
-        stats.append("\nCrew    ", rgb(p.muted))
+        stats.append(" Crew ", rgb(p.muted))
         for level, initial in zip(self.staff, "VPFSXC"):
             stats.append(f"{initial} ", rgb(p.success) if level >= 0 else rgb(p.faint))
+        stats.append("\nStatus  ", rgb(p.muted))
+        stats.append(rank, f"bold {rgb(p.success)}")
+        progress = f" ({fmt(self.fame)}/{fmt(rank_need)})"
+        if len("Status  " + rank + progress) <= ROW_W:  # drop it rather than wrap
+            stats.append(progress, rgb(p.muted))
         self.set_text("#stats", stats)
 
         titles = {"servers": "MARKETPLACE  [s]", "chips": "CHIP UPGRADES  [c]",
@@ -849,7 +985,9 @@ class DataCenter(App):
             shop.append("     ")
             shop.append(f"${fmt(cost)}", f"bold {rgb(p.success)}" if ok else rgb(p.error))
             each = tier_income(i, 1, self.chips[i], self.cur)
-            shop.append(f"  ·  +${fmt(each)}/s\n", rgb(p.muted))
+            shop.append(f" · +${fmt(each)}/s", rgb(p.muted))
+            milestone = next_milestone(self.owned[i])
+            shop.append(f" · x2@{milestone}\n" if milestone else "\n", rgb(p.warning))
         return shop
 
     def chips_text(self) -> Text:
@@ -871,7 +1009,7 @@ class DataCenter(App):
                 shop.append(f"buy a {tier} first\n", rgb(p.faint))
             else:
                 shop.append(f"${fmt(cost)}", f"bold {rgb(p.success)}" if ok else rgb(p.error))
-                shop.append(f"  ·  {tier} x{CHIP_BOOST}\n", rgb(p.muted))
+                shop.append(f" · {tier} x{CHIP_BOOST}\n", rgb(p.muted))
         return shop
 
     def staff_text(self) -> Text:
@@ -879,7 +1017,7 @@ class DataCenter(App):
         for r, (name, _, _, cap, _) in enumerate(STAFF):
             level = self.staff[r]
             maxed = level >= MAX_STAFF
-            cost = 0 if maxed else staff_cost(r, level, self.sites)
+            cost = 0 if maxed else staff_cost(r, level, self.cur)
             ok = not maxed and self.balance >= cost
             accent = rgb(p.success) if ok else rgb(p.muted)
             badge = "hire" if level < 0 else "MAX" if maxed else f"Lv{level}"
@@ -889,44 +1027,52 @@ class DataCenter(App):
             shop.append("     ")
             scope = STAFF_SCOPE[cap - 1]
             if maxed:
-                shop.append(f"fixes {scope}  ·  {response_secs(r, level)}s\n", rgb(p.success))
+                shop.append(f"fixes {scope} · {response_secs(r, level)}s\n", rgb(p.success))
                 continue
             shop.append(f"${fmt(cost)}", f"bold {rgb(p.success)}" if ok else rgb(p.error))
             if level < 0:
-                shop.append(f"  ·  fixes {scope}\n", rgb(p.muted))
+                shop.append(f" · fixes {scope}\n", rgb(p.muted))
             else:
-                shop.append(f"  ·  {response_secs(r, level)}s -> "
+                shop.append(f" · {response_secs(r, level)}s -> "
                             f"{response_secs(r, level + 1)}s\n", rgb(p.muted))
         return shop
 
     def sites_text(self) -> Text:
-        p, t, cur = self.pal, Text(), self.sites  # cur = the newest data center
-        for row, k in enumerate(range(cur, max(-1, cur - 6), -1)):  # keys 1-6, newest first
+        p, t, newest = self.pal, Text(), self.sites
+        for row, k in enumerate(range(newest, max(-1, newest - 6), -1)):  # keys 1-6, newest first
             here = k == self.cur
             inc = f"${fmt(self.site_income(k))}/s"
-            nm = f"#{k + 1} {site_name(k)}"[:ROW_W - 6 - len(inc)]  # only cut what must be cut
+            nm, room = f"#{k + 1} {site_name(k)}", ROW_W - 6 - len(inc)
+            if len(nm) > room:  # only cut what must be cut
+                nm = nm[:room - 1] + "…"
             chip = rgb(p.success) if here else rgb(p.muted)
             t.append(f" {row + 1} ", f"bold {rgb(p.chip_text)} on {chip}")
             t.append(" ▶" if here else "  ", f"bold {rgb(p.success)}")
             t.append(nm, f"bold {rgb(p.primary)}" if here else rgb(p.fg))
             t.append(" " * max(1, ROW_W - 5 - len(nm) - len(inc)))
-            t.append(inc + "\n", rgb(p.warning))
-        if cur > 5:
-            t.append(f"     ... {cur - 5} older: use [ and ] to visit\n", rgb(p.faint))
-        t.append("\n")
-        if cur >= MAX_SITES:
+            t.append(inc + "\n", rgb(p.warning) if here else rgb(p.faint))
+        if newest > 5:
+            t.append(f"     ... {newest - 5} older: use [ and ] to visit\n", rgb(p.faint))
+        t.append("Only the one you are in earns.\n", rgb(p.faint))
+        if newest >= MAX_SITES:
             t.append("You own the multiverse.\n", rgb(p.success))
             return t
-        cost = expand_cost(cur)
-        pct = min(100, self.balance * 100 // cost)
-        ready = self.balance >= cost
-        t.append(f"Next: {site_name(cur + 1)}\n", f"bold {rgb(p.fg)}")
-        t.append(f"${fmt(cost)} to open  ·  {pct}%\n",
+        cost = expand_cost(newest)
+        bal = self.site_balance[newest]
+        pct = min(100, bal * 100 // cost)
+        ready = bal >= cost
+        t.append(f"Next: {site_name(newest + 1)}\n", f"bold {rgb(p.fg)}")
+        t.append(f"${fmt(cost)} in #{newest + 1}  ·  {pct}%\n",
                  rgb(p.success) if ready else rgb(p.muted))
-        filled = pct * 20 // 100
+        filled = pct * 12 // 100  # a short bar leaves room for the hint on the same line
         t.append("█" * filled, rgb(p.success) if ready else rgb(p.primary))
-        t.append("░" * (20 - filled), rgb(p.faint))
-        t.append("  press x to expand\n" if ready else "\n", f"bold {rgb(p.success)}")
+        t.append("░" * (12 - filled), rgb(p.faint))
+        if ready and self.cur == newest:
+            t.append(f"  x: relocate +{fmt(fame_gain(bal, newest))} Fame",
+                     f"bold {rgb(p.success)}")
+        elif ready:
+            t.append("  ] to go there, then x", f"bold {rgb(p.success)}")
+        t.append("\n")
         return t
 
 
