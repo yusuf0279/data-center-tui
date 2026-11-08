@@ -6,6 +6,7 @@ import json
 import math
 import os
 import random
+import subprocess
 import time
 from pathlib import Path
 from typing import Any, ClassVar, cast
@@ -23,7 +24,7 @@ RGB = tuple[int, int, int]
 
 # ---------------------------------------------------------------- game data
 
-# name, base cost, income/sec
+# name, base cost, income/sec (for the first data center)
 TIERS: list[tuple[str, int, int]] = [
     ("Budget VPS", 100, 2),
     ("Compute Node", 600, 14),
@@ -32,34 +33,53 @@ TIERS: list[tuple[str, int, int]] = [
     ("Quantum Farm", 80000, 2500),
     ("Orbital Cloud", 400000, 15000),
 ]
-GROWTH = 1.15
-MAX_OWNED = 4000  # keeps 1.15**n inside float range
+MAX_OWNED = 4000  # per tier; keeps costs finite
 
-# Chip upgrades: three levels per tier, each level doubles that tier's income.
-CHIPS: list[list[str]] = [
-    ["GT 1030 (technically a GPU)", "RX 6400 (low-profile hopes)", "Integrated Graphics Ultra"],
-    ["Ryzen 9 Zen Garden", "Threadripper Pro Max Ultra", "EPYC Epic Failover"],
-    ["RTX 4090 Ti Super Scalper Ed", "RTX 5090 (Paper Launch)", "Jensen's Leather Jacket"],
-    ["H100 (kidney sold separate)", "B200 (melts connector)", "GB200 (needs a power plant)"],
-    ["MI300X (X is for eXpensive)", "MI325X-ception", "Radeon Schrödinger Pro"],
-    ["Rubin Ultra (launch TBD)", "Zen 9 Space Edition", "DGX Moonbase One"],
+# Chip upgrades: 20 levels per tier = 5 families x 4 editions. Each level doubles
+# that tier's income and costs 3x the previous level.
+CHIP_FAMILIES: list[list[str]] = [
+    ["GT 1030", "RX 6400", "Vega 8 (Hopeful)", "GTX 750", "Radeon HD 7000"],
+    ["Ryzen 5 5600", "Ryzen 9 Zen Garden", "Threadripper 3990", "EPYC Milan", "Ryzen Z Handheld"],
+    ["RTX 3090", "RTX 4090", "RTX 5090 (Paper)", "Titan RTX", "Jensen's Jacket"],
+    ["A100", "H100 (a kidney)", "B200 (melts)", "GB200 NVL72", "H200 (sold out)"],
+    ["MI250X", "MI300X (eXpensive)", "MI325X-ception", "MI350 Schrödinger", "Instinct Zero"],
+    ["Rubin Ultra", "Zen 9 Space Ed.", "DGX Moonbase", "Feynman (TBD)", "Dyson GPU"],
 ]
-CHIP_COST_MULT = (20, 200, 2000)  # x the tier's base cost, for levels 1..3
+CHIP_EDITIONS = ["", " Ti", " Super", " Ultra Max"]
+MAX_CHIP = 20
+CHIP_BASE = 20  # level-0 chip costs this many times the tier's base cost
+CHIP_GROWTH = 3
 CHIP_BOOST = 2
-MAX_CHIP = 3
 
-# On-call crew: name, hire cost, tagline, what they handle
-STAFF: list[tuple[str, int, str, str]] = [
-    ("Vibecoder", 5_000, "ships it without reading the diff", "minor incidents"),
-    ("Prompt Engineer", 60_000, "negotiates with the model for you", "outages and below"),
-    ("Forward Deployed Engineer", 750_000, "lives on-site, expenses everything", "everything"),
+# On-call crew: name, hire cost, tagline, highest crisis severity handled, base response (s)
+STAFF: list[tuple[str, int, str, int, float]] = [
+    ("Vibecoder", 5_000, "ships it without reading the diff", 1, 10.0),
+    ("Prompt Engineer", 60_000, "negotiates with the model for you", 2, 9.0),
+    ("Forward Deployed Engineer", 750_000, "lives on-site, expenses everything", 3, 8.0),
+    ("Site Reliability Engineer", 10_000_000, "has seen things", 3, 6.0),
+    ("10x Engineer", 150_000_000, "does not exist, allegedly", 3, 4.0),
+    ("Chief Hype Officer", 2_500_000_000, "raises a round to fix it", 3, 3.0),
 ]
-STAFF_TRAIN_MULT = (3, 9, 27)  # x hire cost, for levels 1..3
-MAX_STAFF = 3
-BASE_RESPONSE = 10.0  # seconds to fix a crisis at level 0
-RESPONSE_DECAY = 0.6  # response time multiplier per level
+STAFF_SCOPE = ["minor incidents", "outages and below", "everything"]
+MAX_STAFF = 10  # training levels after hiring
+RESPONSE_DECAY = 0.8  # response time multiplier per level
+STAFF_BONUS = 5  # percent income per level, counting the hire as level 1
 
-# Crises: severity -> titles. Income multiplier while one is active.
+# Data centers: reach the threshold to open the next one. The old one keeps earning.
+SITE_NAMES = [
+    "Garage in Palo Alto", "Abandoned Mall in Ohio", "Decommissioned Missile Silo",
+    "Arctic Bunker (free cooling)", "Undersea Pod off Iceland", "Lunar Regolith Campus",
+    "Dyson Swarm Annex", "Pocket Universe", "Heat Death Colo",
+    "The Cloud (Actually Water Vapor)",
+]
+EXPAND_BASE = 10**9  # cost to open data center #2
+EXPAND_SCALE = 1000  # each later one needs 1000x more
+INCOME_SCALE = 1000  # tier income multiplier per data center
+COST_SCALE = 2500  # tier/chip/crew cost multiplier per data center
+MAX_SITES = 60
+MAX_BIG = 10**600  # sanity bound for numbers read from a save file
+
+# Crises: severity -> titles. Income multiplier (num, den) while one is active.
 CRISES: dict[int, list[str]] = {
     1: ["CI is stuck on a flaky test", "Janitor unplugged a rack to vacuum",
         "Someone pasted the API key into Slack"],
@@ -68,7 +88,7 @@ CRISES: dict[int, list[str]] = {
     3: ["GPU shortage: scalpers bought every H100", "Intern force-pushed to main on a Friday",
         "Solar flare fried the Orbital Cloud"],
 }
-CRISIS_FACTOR = {1: 0.5, 2: 0.25, 3: 0.0}
+CRISIS_FACTOR = {1: (1, 2), 2: (1, 4), 3: (0, 1)}
 CRISIS_WEIGHT = {1: 5, 2: 3, 3: 2}
 CRISIS_MEAN = 120  # average seconds between crises
 CRISIS_MIN_INCOME = 10
@@ -79,9 +99,12 @@ FIX_QUIPS = [
 ]
 
 DEFAULT_THEME = "gruvbox"
-OFFLINE_RATE = 0.75  # share of normal income earned while the game is closed
+OFFLINE_NUM, OFFLINE_DEN = 3, 4  # earn 75% of normal income while the game is closed
 ROW_W = 40  # inner width of the side cards
 LED_PERIOD = 2  # ticks (seconds) per LED step; every step repaints the hall
+# Under tmux, any repaint of a background pane makes tmux hop the real cursor over to
+# it and back. So when this pane isn't the one you're typing in, redraw only this often.
+BACKGROUND_REFRESH = 20  # seconds
 
 # Sprite legend: k frame, c tier colour, h highlight, d dark, w pale window/fan,
 # A/B blinking LEDs, . empty. One distinct silhouette per tier.
@@ -94,6 +117,48 @@ SPRITES: list[list[str]] = [
     ["..hA..", "cckkcc", "cchhcc", "cckkcc", "..kk..", "..dd.."],  # satellite
 ]
 CELL_W, CELL_H = 7, 8  # 6x6 sprite, one gap column, shadow row at the bottom
+
+
+# ------------------------------------------------------------------ economy
+# Pure functions (exact integer maths, so numbers can grow without limit).
+
+def site_name(k: int) -> str:
+    return SITE_NAMES[k] if k < len(SITE_NAMES) else f"Parallel Universe #{k - len(SITE_NAMES) + 1}"
+
+
+def expand_cost(site: int) -> int:
+    """Cost to leave data center `site` and open the next one."""
+    return EXPAND_BASE * EXPAND_SCALE**site
+
+
+def cost_of(tier: int, owned: int, site: int = 0) -> int:
+    return TIERS[tier][1] * COST_SCALE**site * 115**owned // 100**owned
+
+
+def tier_income(tier: int, owned: int, chip: int, site: int = 0) -> int:
+    return owned * TIERS[tier][2] * INCOME_SCALE**site * CHIP_BOOST**chip
+
+
+def chip_name(tier: int, level: int) -> str:
+    return CHIP_FAMILIES[tier][level // 4] + CHIP_EDITIONS[level % 4]
+
+
+def chip_cost(tier: int, level: int, site: int = 0) -> int:
+    return TIERS[tier][1] * CHIP_BASE * CHIP_GROWTH**level * COST_SCALE**site
+
+
+def staff_cost(role: int, level: int, site: int = 0) -> int:
+    """Cost to hire (level -1) or to train from `level` to level+1."""
+    hire = STAFF[role][1] * COST_SCALE**site
+    return hire if level < 0 else hire * 3 * 9**level // 5**level
+
+
+def response_time(role: int, level: int) -> float:
+    return STAFF[role][4] * RESPONSE_DECAY**level
+
+
+def response_secs(role: int, level: int) -> int:
+    return max(1, math.ceil(response_time(role, level)))
 
 
 # ------------------------------------------------------------------ helpers
@@ -113,6 +178,21 @@ def load_save() -> dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
+def tmux_foreground() -> bool:
+    """False only when we are in tmux and this pane is NOT the active pane of the
+    visible window (focus-events are usually off, so tmux itself is the only source)."""
+    pane = os.environ.get("TMUX_PANE")
+    if not pane:
+        return True
+    try:
+        out = subprocess.run(
+            ["tmux", "display-message", "-p", "-t", pane, "#{pane_active}#{window_active}"],
+            capture_output=True, text=True, timeout=0.5).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return True
+    return out not in ("10", "01", "00")
+
+
 def clean_levels(raw: Any, n: int, lo: int, hi: int, default: int) -> list[int]:
     """A list of n ints in [lo, hi]; anything invalid falls back to default."""
     out = [default] * n
@@ -123,11 +203,22 @@ def clean_levels(raw: Any, n: int, lo: int, hi: int, default: int) -> list[int]:
     return out
 
 
-def fmt(n: float) -> str:
-    for limit, suffix in ((1e15, "Qa"), (1e12, "T"), (1e9, "B"), (1e6, "M"), (1e3, "K")):
-        if n >= limit:
-            return f"{n / limit:.2f}{suffix}"
-    return f"{int(n):,}"
+SUFFIXES = ["", "K", "M", "B", "T", "Qa", "Qi", "Sx", "Sp", "Oc", "No", "Dc"]
+
+
+def fmt(n: int) -> str:
+    n = max(0, int(n))
+    if n < 1000:
+        return f"{n:,}"
+    digits = len(str(n))
+    group = (digits - 1) // 3
+    if group < len(SUFFIXES):
+        mant = n / 10 ** (3 * group)
+        if mant < 999.995:
+            return f"{mant:.2f}{SUFFIXES[group]}"
+        if group + 1 < len(SUFFIXES):  # would round up to "1000.00": use the next unit
+            return f"{n / 10 ** (3 * (group + 1)):.2f}{SUFFIXES[group + 1]}"
+    return f"{int(str(n)[:3]) / 100:.2f}e{digits - 1}"
 
 
 def fmt_duration(seconds: float) -> str:
@@ -137,23 +228,6 @@ def fmt_duration(seconds: float) -> str:
     if d:
         return f"{d}d {h}h"
     return f"{h}h {m}m" if h else f"{m}m"
-
-
-def cost_of(tier: int, owned: int) -> int:
-    return int(TIERS[tier][1] * GROWTH**owned)
-
-
-def chip_cost(tier: int, level: int) -> int:
-    return TIERS[tier][1] * CHIP_COST_MULT[level]
-
-
-def staff_cost(role: int, level: int) -> int:
-    """Cost to hire (level -1) or to train from `level` to level+1."""
-    return STAFF[role][1] * (1 if level < 0 else STAFF_TRAIN_MULT[level])
-
-
-def response_time(level: int) -> float:
-    return BASE_RESPONSE * RESPONSE_DECAY**level
 
 
 def mix(a: RGB, b: RGB, t: float) -> RGB:
@@ -331,7 +405,9 @@ class DataCenter(App):
         *(Binding(str(i + 1), f"pick({i})", "Pick", show=False) for i in range(6)),
         Binding("s", "view('servers')", "Servers"),
         Binding("c", "view('chips')", "Chips"),
-        Binding("h", "view('staff')", "Staff"),
+        Binding("h", "view('staff')", "Crew"),
+        Binding("d", "view('sites')", "Data centers"),
+        Binding("x", "expand", "Expand"),
         Binding("f", "fix", "Fix"),
         Binding("q", "quit", "Quit"),
     ]
@@ -340,7 +416,15 @@ class DataCenter(App):
         super().__init__()
         data = load_save()
         balance = data.get("balance")
-        self.balance = balance if type(balance) is int and 0 <= balance < 10**100 else 500
+        self.balance = balance if type(balance) is int and 0 <= balance < MAX_BIG else 500
+        sites = data.get("sites")
+        self.sites = sites if type(sites) is int and 0 <= sites <= MAX_SITES else 0
+        self.legacy = [0] * self.sites  # final income of each finished data center
+        raw_legacy = data.get("legacy")
+        if isinstance(raw_legacy, list):
+            for i, v in enumerate(raw_legacy[:self.sites]):
+                if type(v) is int and 0 <= v < MAX_BIG:
+                    self.legacy[i] = v
         self.owned = clean_levels(data.get("owned"), len(TIERS), 0, MAX_OWNED, 0)
         self.chips = clean_levels(data.get("chips"), len(TIERS), 0, MAX_CHIP, 0)
         self.staff = clean_levels(data.get("staff"), len(STAFF), -1, MAX_STAFF, -1)
@@ -350,18 +434,19 @@ class DataCenter(App):
         self.crisis: dict[str, Any] | None = None
         self.rng = random.Random()
         self.phase = 0
+        self.foreground = True
         self._pal: Palette | None = None
         self._last: dict[str, Text] = {}
         self._titles: dict[str, str] = {}
         self._hall_sig: tuple[Any, ...] | None = None
-        # Offline earnings: OFFLINE_RATE of income for the time since the last save
+        # Offline earnings: 75% of income for the time since the last save
         self.away = (0.0, 0)
         saved_at = data.get("saved_at")
         if isinstance(saved_at, (int, float)) and not isinstance(saved_at, bool):
             try:  # huge ints overflow float conversion; treat those as "no data"
                 if math.isfinite(saved_at) and saved_at > 0:
                     elapsed = max(0.0, time.time() - saved_at)
-                    earned = int(elapsed * self.base_income * OFFLINE_RATE)
+                    earned = int(elapsed) * self.base_income * OFFLINE_NUM // OFFLINE_DEN
                     if earned > 0:
                         self.balance += earned
                         self.away = (elapsed, earned)
@@ -377,7 +462,8 @@ class DataCenter(App):
             tmp = path.with_suffix(".tmp")
             tmp.write_text(json.dumps({
                 "balance": self.balance, "owned": self.owned, "chips": self.chips,
-                "staff": self.staff, "theme": self.theme, "saved_at": time.time(),
+                "staff": self.staff, "sites": self.sites, "legacy": self.legacy,
+                "theme": self.theme, "saved_at": time.time(),
             }))
             os.replace(tmp, path)
         except OSError:
@@ -402,14 +488,29 @@ class DataCenter(App):
         return self._pal
 
     @property
+    def site_base(self) -> int:
+        """This data center's income before the crew bonus."""
+        return sum(tier_income(t, n, c, self.sites)
+                   for t, (n, c) in enumerate(zip(self.owned, self.chips)))
+
+    @property
+    def staff_bonus(self) -> int:
+        """Percent income bonus from the crew."""
+        return STAFF_BONUS * sum(level + 1 for level in self.staff if level >= 0)
+
+    @property
+    def site_income(self) -> int:
+        return self.site_base * (100 + self.staff_bonus) // 100
+
+    @property
     def base_income(self) -> int:
-        return sum(n * t[2] * CHIP_BOOST**c
-                   for n, t, c in zip(self.owned, TIERS, self.chips))
+        """Everything earning right now, ignoring any crisis."""
+        return self.site_income + sum(self.legacy)
 
     @property
     def income(self) -> int:
-        factor = CRISIS_FACTOR[self.crisis["sev"]] if self.crisis else 1.0
-        return int(self.base_income * factor)
+        num, den = CRISIS_FACTOR[self.crisis["sev"]] if self.crisis else (1, 1)
+        return self.base_income * num // den
 
     # -- layout ------------------------------------------------------------
 
@@ -425,11 +526,10 @@ class DataCenter(App):
                 yield Static(id="stats", classes="card")
                 yield Static(id="shop", classes="card")
         yield Static(id="alert")
-        yield Static("1-6 pick  s servers  c chips  h staff  f fix  ctrl+p theme  q quit",
+        yield Static("1-6 pick  s c h d views  x expand  f fix  ctrl+p theme  q quit",
                      id="hint")
 
     def on_mount(self) -> None:
-        self.query_one("#hall").border_title = "DATA HALL"
         self.query_one("#stats").border_title = "OVERVIEW"
         self.query_one("#log").border_title = "ACTIVITY"
         self.theme = (self.saved_theme if self.saved_theme in self.available_themes
@@ -441,7 +541,7 @@ class DataCenter(App):
         if self.away[1] > 0:
             log.write(Text(
                 f"Welcome back! Away {fmt_duration(self.away[0])}, "
-                f"earned ${fmt(self.away[1])} ({OFFLINE_RATE:.0%} offline rate)",
+                f"earned ${fmt(self.away[1])} ({OFFLINE_NUM * 100 // OFFLINE_DEN}% offline rate)",
                 style=rgb(self.pal.warning)))
         self.set_interval(1.0, self.tick)  # one frame per second keeps tmux calm
         self.redraw()
@@ -457,7 +557,9 @@ class DataCenter(App):
         self.balance += self.income
         self.phase += 1
         self.update_crisis()
-        self.redraw()
+        self.foreground = tmux_foreground()
+        if self.foreground or self.phase % BACKGROUND_REFRESH == 0:
+            self.redraw()  # coming back to the front redraws on the very next tick
         self.save()
 
     def say(self, text: str, colour: RGB) -> None:
@@ -466,11 +568,14 @@ class DataCenter(App):
     # -- crises ------------------------------------------------------------
 
     def fixer_for(self, sev: int) -> int | None:
-        """Cheapest hired role that can handle this severity."""
-        for role in range(sev - 1, len(STAFF)):
-            if self.staff[role] >= 0:
-                return role
-        return None
+        """The hired crew member who can handle this severity and responds fastest."""
+        best: tuple[float, int] | None = None
+        for role, (_, _, _, cap, _) in enumerate(STAFF):
+            if self.staff[role] >= 0 and cap >= sev:
+                t = response_time(role, self.staff[role])
+                if best is None or t < best[0]:
+                    best = (t, role)
+        return None if best is None else best[1]
 
     def update_crisis(self) -> None:
         c = self.crisis
@@ -478,7 +583,7 @@ class DataCenter(App):
             if c["fixer"] is None:  # someone may have been hired since it started
                 c["fixer"] = self.fixer_for(c["sev"])
                 if c["fixer"] is not None:
-                    c["eta"] = math.ceil(response_time(self.staff[c["fixer"]]))
+                    c["eta"] = response_secs(c["fixer"], self.staff[c["fixer"]])
             if c["fixer"] is not None:
                 c["eta"] -= 1
                 if c["eta"] <= 0:
@@ -490,17 +595,17 @@ class DataCenter(App):
 
     def spawn_crisis(self) -> None:
         sevs = [1]
-        if sum(self.owned) >= 5:
+        if sum(self.owned) >= 5 or self.sites > 0:
             sevs.append(2)
-        if self.base_income >= 200:
+        if self.sites > 0 or self.site_base >= 200:
             sevs.append(3)
         sev = self.rng.choices(sevs, [CRISIS_WEIGHT[s] for s in sevs])[0]
         title = self.rng.choice(CRISES[sev])
         fixer = self.fixer_for(sev)
-        eta = math.ceil(response_time(self.staff[fixer])) if fixer is not None else None
+        eta = response_secs(fixer, self.staff[fixer]) if fixer is not None else None
         self.crisis = {"title": title, "sev": sev, "fixer": fixer, "eta": eta}
-        cut = round((1 - CRISIS_FACTOR[sev]) * 100)
-        self.say(f"! {title} (income -{cut}%)", self.pal.error)
+        num, den = CRISIS_FACTOR[sev]
+        self.say(f"! {title} (income -{100 - num * 100 // den}%)", self.pal.error)
 
     def resolve(self, fixer: int | None) -> None:
         if self.crisis is None:
@@ -529,13 +634,13 @@ class DataCenter(App):
             return
         if self.side == "chips":
             self.buy_chip(i)
-        elif i < len(STAFF):
+        elif self.side == "staff" and i < len(STAFF):
             self.hire_staff(i)
         self.redraw()
         self.save()
 
     def action_buy(self, tier: int) -> None:
-        p, cost = self.pal, cost_of(tier, self.owned[tier])
+        p, cost = self.pal, cost_of(tier, self.owned[tier], self.sites)
         if self.owned[tier] >= MAX_OWNED:
             self.say(f"{TIERS[tier][0]}: that's enough, truly", p.muted)
         elif self.balance >= cost:
@@ -551,29 +656,55 @@ class DataCenter(App):
         p, level = self.pal, self.chips[tier]
         if level >= MAX_CHIP:
             self.say(f"{TIERS[tier][0]} chips are maxed out", p.muted)
-        elif self.owned[tier] == 0:
+            return
+        cost = chip_cost(tier, level, self.sites)
+        if self.owned[tier] == 0:
             self.say(f"! buy a {TIERS[tier][0]} first", p.error)
-        elif self.balance < chip_cost(tier, level):
-            self.say(f"! need ${fmt(chip_cost(tier, level))} for the {CHIPS[tier][level]}", p.error)
+        elif self.balance < cost:
+            self.say(f"! need ${fmt(cost)} for the {chip_name(tier, level)}", p.error)
         else:
-            self.balance -= chip_cost(tier, level)
+            self.balance -= cost
             self.chips[tier] += 1
-            self.say(f"+ {CHIPS[tier][level]}: {TIERS[tier][0]} income x{CHIP_BOOST}", p.success)
+            self.say(f"+ {chip_name(tier, level)}: {TIERS[tier][0]} income x{CHIP_BOOST}",
+                     p.success)
 
     def hire_staff(self, role: int) -> None:
         p, level = self.pal, self.staff[role]
-        name = STAFF[role][0]
+        name, _, tagline, _, _ = STAFF[role]
         if level >= MAX_STAFF:
             self.say(f"{name} is already a 10x legend", p.muted)
             return
-        cost = staff_cost(role, level)
+        cost = staff_cost(role, level, self.sites)
         if self.balance < cost:
             self.say(f"! need ${fmt(cost)} for the {name}", p.error)
             return
         self.balance -= cost
         self.staff[role] += 1
-        verb = "Hired a" if level < 0 else "Trained the"
-        self.say(f"+ {verb} {name} (Lv {self.staff[role]})", p.success)
+        if level < 0:
+            self.say(f"+ Hired a {name}: {tagline}", p.success)
+        else:
+            self.say(f"+ Trained the {name} (Lv {self.staff[role]})", p.success)
+
+    def action_expand(self) -> None:
+        p = self.pal
+        if self.sites >= MAX_SITES:
+            self.say("You own the multiverse. For now.", p.muted)
+            return
+        cost = expand_cost(self.sites)
+        if self.balance < cost:
+            self.say(f"! need ${fmt(cost)} to open {site_name(self.sites + 1)}", p.error)
+        else:
+            self.balance -= cost
+            self.legacy.append(self.site_income)
+            self.sites += 1
+            self.owned = [0] * len(TIERS)
+            self.chips = [0] * len(TIERS)
+            self.crisis = None
+            self.side = "servers"
+            self.say(f"★ Opened {site_name(self.sites)}! {site_name(self.sites - 1)} keeps "
+                     f"earning ${fmt(self.legacy[-1])}/s", p.success)
+        self.redraw()
+        self.save()
 
     # -- drawing -----------------------------------------------------------
 
@@ -604,28 +735,30 @@ class DataCenter(App):
         for n, colour in zip(self.owned, p.tiers):
             stats.append("■ ", rgb(colour) if n else rgb(p.faint))
         stats.append("\nCrew    ", rgb(p.muted))
-        for level, initial in zip(self.staff, "VPF"):
+        for level, initial in zip(self.staff, "VPFSXC"):
             stats.append(f"{initial} ", rgb(p.success) if level >= 0 else rgb(p.faint))
         self.set_text("#stats", stats)
 
         titles = {"servers": "MARKETPLACE  [s]", "chips": "CHIP UPGRADES  [c]",
-                  "staff": "ON-CALL CREW  [h]"}
+                  "staff": f"ON-CALL CREW · +{self.staff_bonus}% income  [h]",
+                  "sites": "DATA CENTERS  [d]"}
         self.set_title("#shop", titles[self.side])
         self.set_text("#shop", {"servers": self.servers_text, "chips": self.chips_text,
-                                "staff": self.staff_text}[self.side]())
+                                "staff": self.staff_text, "sites": self.sites_text}[self.side]())
 
         c = self.crisis
         alert = self.query_one("#alert", Static)
         if alert.display != (c is not None):  # re-assigning it forces a repaint
             alert.display = c is not None
         if c is not None:
-            cut = round((1 - CRISIS_FACTOR[c["sev"]]) * 100)
+            num, den = CRISIS_FACTOR[c["sev"]]
             who = (f"{STAFF[c['fixer']][0]} responding ({c['eta']}s)"
                    if c["fixer"] is not None else "press F to fix")
-            self.set_text("#alert", Text(f"⚠ {c['title']}  ·  income -{cut}%  ·  {who}"))
+            self.set_text("#alert", Text(
+                f"⚠ {c['title']}  ·  income -{100 - num * 100 // den}%  ·  {who}"))
 
-        self.set_title("#hall", f"DATA HALL · {sum(self.owned)} racks")
-        sig =(tuple(self.owned), self.crisis is not None, id(p),
+        self.set_title("#hall", f"{site_name(self.sites)} · {sum(self.owned)} racks")
+        sig = (tuple(self.owned), self.crisis is not None, id(p),
                self.phase // LED_PERIOD if sum(self.owned) else 0)
         if sig != self._hall_sig:  # a static hall costs nothing to leave alone
             self._hall_sig = sig
@@ -641,16 +774,16 @@ class DataCenter(App):
     def servers_text(self) -> Text:
         p, shop = self.pal, Text()
         for i, (name, _, inc) in enumerate(TIERS):
-            cost = cost_of(i, self.owned[i])
+            cost = cost_of(i, self.owned[i], self.sites)
             ok = self.balance >= cost
             accent = rgb(p.tiers[i]) if ok else rgb(p.muted)
-            badge = f"x{self.owned[i]}"
-            self.row(shop, i + 1, name, badge, accent,
+            self.row(shop, i + 1, name, f"x{self.owned[i]}", accent,
                      f"bold {accent}" if ok else rgb(p.muted),
                      rgb(p.fg) if self.owned[i] else rgb(p.faint))
             shop.append("     ")
             shop.append(f"${fmt(cost)}", f"bold {rgb(p.success)}" if ok else rgb(p.error))
-            shop.append(f"  ·  +${fmt(inc * CHIP_BOOST**self.chips[i])}/s\n", rgb(p.muted))
+            each = tier_income(i, 1, self.chips[i], self.sites)
+            shop.append(f"  ·  +${fmt(each)}/s\n", rgb(p.muted))
         return shop
 
     def chips_text(self) -> Text:
@@ -658,16 +791,16 @@ class DataCenter(App):
         for i, (tier, _, _) in enumerate(TIERS):
             level = self.chips[i]
             maxed = level >= MAX_CHIP
-            name = CHIPS[i][min(level, MAX_CHIP - 1)]
-            cost = 0 if maxed else chip_cost(i, level)
+            name = chip_name(i, min(level, MAX_CHIP - 1))
+            cost = 0 if maxed else chip_cost(i, level, self.sites)
             ok = not maxed and self.owned[i] > 0 and self.balance >= cost
             accent = rgb(p.tiers[i]) if ok else rgb(p.muted)
-            self.row(shop, i + 1, name, "MAX" if maxed else f"Lv{level}/{MAX_CHIP}", accent,
+            self.row(shop, i + 1, name, "MAX" if maxed else f"L{level}", accent,
                      f"bold {accent}" if ok else rgb(p.muted),
                      rgb(p.success) if maxed else rgb(p.fg) if level else rgb(p.faint))
             shop.append("     ")
             if maxed:
-                shop.append(f"{tier} income x{CHIP_BOOST**MAX_CHIP}\n", rgb(p.success))
+                shop.append(f"{tier} income x{CHIP_BOOST**MAX_CHIP:,}\n", rgb(p.success))
             elif self.owned[i] == 0:
                 shop.append(f"buy a {tier} first\n", rgb(p.faint))
             else:
@@ -677,10 +810,10 @@ class DataCenter(App):
 
     def staff_text(self) -> Text:
         p, shop = self.pal, Text()
-        for r, (name, _, tagline, scope) in enumerate(STAFF):
+        for r, (name, _, _, cap, _) in enumerate(STAFF):
             level = self.staff[r]
             maxed = level >= MAX_STAFF
-            cost = 0 if maxed else staff_cost(r, level)
+            cost = 0 if maxed else staff_cost(r, level, self.sites)
             ok = not maxed and self.balance >= cost
             accent = rgb(p.success) if ok else rgb(p.muted)
             badge = "hire" if level < 0 else "MAX" if maxed else f"Lv{level}"
@@ -688,18 +821,46 @@ class DataCenter(App):
                      f"bold {accent}" if ok else rgb(p.muted),
                      rgb(p.fg) if level >= 0 else rgb(p.faint))
             shop.append("     ")
+            scope = STAFF_SCOPE[cap - 1]
             if maxed:
-                shop.append(f"fixes {scope}  ·  {math.ceil(response_time(level))}s\n",
-                            rgb(p.success))
+                shop.append(f"fixes {scope}  ·  {response_secs(r, level)}s\n", rgb(p.success))
+                continue
+            shop.append(f"${fmt(cost)}", f"bold {rgb(p.success)}" if ok else rgb(p.error))
+            if level < 0:
+                shop.append(f"  ·  fixes {scope}\n", rgb(p.muted))
             else:
-                shop.append(f"${fmt(cost)}", f"bold {rgb(p.success)}" if ok else rgb(p.error))
-                if level < 0:
-                    shop.append(f"  ·  fixes {scope}\n", rgb(p.muted))
-                else:
-                    shop.append(f"  ·  train: {math.ceil(response_time(level))}s"
-                                f" -> {math.ceil(response_time(level + 1))}s\n", rgb(p.muted))
-            shop.append(f"     {tagline}\n", rgb(p.faint))
+                shop.append(f"  ·  {response_secs(r, level)}s -> "
+                            f"{response_secs(r, level + 1)}s\n", rgb(p.muted))
         return shop
+
+    def sites_text(self) -> Text:
+        p, t, cur = self.pal, Text(), self.sites
+        t.append("▶ ", f"bold {rgb(p.success)}")
+        t.append(f"#{cur + 1} {site_name(cur)}\n", f"bold {rgb(p.primary)}")
+        t.append(f"    ${fmt(self.site_income)}/s  ·  {sum(self.owned)} racks\n", rgb(p.muted))
+        for k in range(cur - 1, max(-1, cur - 6), -1):
+            nm = f"#{k + 1} {site_name(k)}"[:30]
+            inc = f"${fmt(self.legacy[k] if k < len(self.legacy) else 0)}/s"
+            t.append(f"  {nm}", rgb(p.fg))
+            t.append(" " * max(1, ROW_W - 2 - len(nm) - len(inc)))
+            t.append(inc + "\n", rgb(p.warning))
+        if cur > 6:
+            t.append(f"  ... and {cur - 6} older\n", rgb(p.faint))
+        t.append("\n")
+        if cur >= MAX_SITES:
+            t.append("You own the multiverse.\n", rgb(p.success))
+            return t
+        cost = expand_cost(cur)
+        pct = min(100, self.balance * 100 // cost)
+        ready = self.balance >= cost
+        t.append(f"Next: {site_name(cur + 1)}\n", f"bold {rgb(p.fg)}")
+        t.append(f"${fmt(cost)} to open  ·  {pct}%\n",
+                 rgb(p.success) if ready else rgb(p.muted))
+        filled = pct * 20 // 100
+        t.append("█" * filled, rgb(p.success) if ready else rgb(p.primary))
+        t.append("░" * (20 - filled), rgb(p.faint))
+        t.append("  press x to expand\n" if ready else "\n", f"bold {rgb(p.success)}")
+        return t
 
 
 if __name__ == "__main__":
