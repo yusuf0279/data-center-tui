@@ -100,7 +100,8 @@ function buildHtml(webview, media) {
   );
   const csp =
     `default-src 'none'; img-src ${webview.cspSource} data:; ` +
-    `style-src ${webview.cspSource} 'unsafe-inline'; script-src 'nonce-${nonce}';`;
+    `style-src ${webview.cspSource} 'unsafe-inline'; script-src 'nonce-${nonce}'; ` +
+    `connect-src https://data-center.openexplorer.xyz;`;
   const bridge = `<script nonce="${nonce}">
     const vscode = acquireVsCodeApi();
     let waiting = null;

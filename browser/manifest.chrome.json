@@ -9,5 +9,7 @@
     "default_icon": { "16": "icons/icon16.png", "32": "icons/icon32.png" }
   },
   "background": { "service_worker": "background.js" },
-  "permissions": ["storage"]
+  "permissions": ["storage"],
+  "host_permissions": ["https://data-center.openexplorer.xyz/*"],
+  "content_security_policy": { "extension_pages": "script-src 'self'; object-src 'self'; connect-src 'self' https://data-center.openexplorer.xyz" }
 }

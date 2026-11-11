@@ -16,5 +16,7 @@ npm run build        # from the repository root; writes browser/dist/chrome and 
 ## Notes
 
 - Progress is saved in the extension's own storage. The game only ticks while its tab is open; when you come back you earn 75% of your income for the time you were away.
-- The extension asks for the `storage` permission only. It makes no network requests.
+- The extension asks for the `storage` permission and host access to `https://data-center.openexplorer.xyz/*`. It makes no network request unless you join the leaderboard.
+- Leaderboard participation is opt-in and sends only your name, Fame and number of data centers (plus a random token) to `data-center.openexplorer.xyz`. Clearing the extension's storage loses the leaderboard identity token. See PRIVACY.md.
+- Firefox needs version 127 or newer (Manifest V3 host permissions are granted at install from there).
 - Keys: `1`-`6` pick, `s` `c` `h` `d` switch card, `x` open the next data center, `f` fix a crisis, `[` `]` visit older or newer data centers. Everything is also clickable.

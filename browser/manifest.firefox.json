@@ -10,7 +10,9 @@
   },
   "background": { "scripts": ["background.js"] },
   "permissions": ["storage"],
+  "host_permissions": ["https://data-center.openexplorer.xyz/*"],
+  "content_security_policy": { "extension_pages": "script-src 'self'; object-src 'self'; connect-src 'self' https://data-center.openexplorer.xyz" },
   "browser_specific_settings": {
-    "gecko": { "id": "my-data-center@yusuf0279.local", "strict_min_version": "115.0" }
+    "gecko": { "id": "my-data-center@yusuf0279.local", "strict_min_version": "127.0" }
   }
 }
