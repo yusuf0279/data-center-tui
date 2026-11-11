@@ -21,8 +21,9 @@ Fame, then by number of data centers, then by who got there first.
 
 **This is an honour-system board.** The game runs on the player's machine, so the server can only
 sanity-check a score (Fame is at least the number of relocations, and not absurdly large). It cannot
-prove a score is real. Nothing is logged per request, so no IP addresses are written to disk; IPs
-are only held in memory briefly for rate limiting.
+prove a score is real. The application writes no request logs and holds IP addresses in memory only
+briefly for rate limiting. (The reverse proxy and Cloudflare in front of it may keep their own access
+logs: see [PRIVACY.md](../PRIVACY.md).)
 
 Limits: 2 KB request bodies, 10 s between updates per player, 120 requests per minute per IP,
 5 new players per address per hour, 20,000 players. The rate limit trusts the `CF-Connecting-IP` /
@@ -34,7 +35,7 @@ be spoofed by connecting directly.
 ```
 DC_DB=/tmp/leaderboard.db PORT=8080 python3 leaderboard.py
 python3 -m unittest discover -s . -p test_server.py        # the tests
-DC_SERVER=http://127.0.0.1:8080 python3 ../dc.py            # point the game at it
+DC_SERVER=http://127.0.0.1:8080 python3 -m data_center_tui   # (from the repo root) point the game at it
 ```
 
 ## Deploy (dokkt)

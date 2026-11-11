@@ -6,3 +6,7 @@ vscode/media/
 browser/dist/
 *.vsix
 node_modules/
+# python packaging
+dist/
+build/
+*.egg-info/
