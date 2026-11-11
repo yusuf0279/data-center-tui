@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Web port of the game (`web/`), shared by the VS Code extension and the Chrome/Firefox extensions (`npm run build`)
+- Extensions can use the optional leaderboard: opt-in, sends only name, Fame and number of data centers to `data-center.openexplorer.xyz` (webview CSP and extension host permission restricted to that origin). Clearing extension storage loses the leaderboard identity token
+- Firefox extension now requires Firefox 127 or newer, so the host permission is granted at install
+
 ## 0.1.0
 
 First release.

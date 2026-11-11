@@ -26,10 +26,19 @@ The leaderboard application itself does not write request logs. Web traffic to i
 proxy and through Cloudflare, which may keep their own standard access logs (including IP addresses) under
 their own policies. The application briefly holds IP addresses in memory only to rate limit requests.
 
+## In the VS Code and browser extensions
+
+The web game inside the extensions follows the same rules: joining is opt-in, and only the name, Fame and number of
+data centers (plus the token) go to `data-center.openexplorer.xyz`, which is the only origin the extensions may
+contact. The save, including the leaderboard name and token, lives in the extension's own storage (VS Code's
+extension storage, or the browser's `storage.local`). **Clearing that storage loses the leaderboard identity
+token**: you can no longer update or remove your old entry from this install, and joining again creates a new entry.
+Ask for the old one to be removed via the contact below.
+
 ## Turning it off
 
 `data-center-tui --no-online`, or set `DC_ONLINE=0`. With it off the game never makes a network request.
-If you decline the first-run question, nothing is ever sent.
+If you decline the first-run question, nothing about you is ever sent. Opening the leaderboard view still downloads the public top list (a plain GET that carries no data from you, though the server and proxy see your IP address as for any request).
 
 ## Contact
 

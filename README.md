@@ -86,7 +86,9 @@ python -m unittest discover -s tests                         # the game (about 4
 python -m unittest discover -s server -p test_server.py      # the leaderboard server
 ```
 
-`data_center_tui/game.py` is the whole game, `server/` is the leaderboard server (see [`server/README.md`](server/README.md)), `tests/` holds the tests. The VS Code extension (`vscode/`) and browser extension (`browser/`) are not usable yet: they need a web version of the game that has not been rebuilt on the current rules.
+`data_center_tui/game.py` is the whole game, `server/` is the leaderboard server (see [`server/README.md`](server/README.md)), `tests/` holds the tests. The web port lives in `web/`; `npm run build` copies it into the VS Code extension (`vscode/media`) and the browser extensions (`browser/dist/chrome`, `browser/dist/firefox`), and `npm test` runs its Node tests.
+
+What was verified headlessly: the build output, that both browser manifests parse and reference only files that exist in `browser/dist`, the extension CSP and host permission strings, `vsce package` producing a `.vsix`, and the web tests under `web/test/`. Not verified: loading the extensions in a real Chrome, Firefox or VS Code, rendering, and live requests to the leaderboard server from inside a webview or extension page. The extensions' leaderboard is opt-in and sends only name, Fame and number of data centers to `data-center.openexplorer.xyz`; clearing extension storage loses the leaderboard identity token.
 
 ## Credits
 
