@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en" data-theme="gruvbox">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>My Data Center</title>
+<link rel="stylesheet" href="dc.css">
+</head>
+<body>
+<div id="app">
+  <header id="top">
+    <span id="title">&#9670; MY DATA CENTER</span>
+    <select id="theme" aria-label="Theme"></select>
+    <button id="menuBtn" data-act="menu" title="Menu (m)">Menu <kbd>m</kbd></button>
+    <span id="cash"></span>
+  </header>
+  <div id="banner" role="status" hidden></div>
+  <main id="main">
+    <section id="left">
+      <div class="card" id="hallCard">
+        <h2>
+          <button class="nav" data-act="prev" title="Older data center ([)" aria-label="Older data center">&lsaquo;</button>
+          <span class="grow" id="hallTitle"></span>
+          <button class="nav" data-act="next" title="Newer data center (])" aria-label="Newer data center">&rsaquo;</button>
+        </h2>
+        <div id="hallWrap">
+          <canvas id="hall" role="img" aria-label="Your racks"></canvas>
+          <div id="hallEmpty" hidden>Empty hall. Press 1 to buy your first server.</div>
+        </div>
+      </div>
+      <div class="card" id="logCard">
+        <h2>ACTIVITY</h2>
+        <div id="log" aria-live="polite"></div>
+      </div>
+    </section>
+    <aside id="side">
+      <div class="card" id="statsCard">
+        <h2>OVERVIEW</h2>
+        <div id="stats"></div>
+      </div>
+      <div class="card" id="shopCard">
+        <div id="tabs" role="tablist">
+          <button class="tab" role="tab" data-view="servers">Servers <kbd>s</kbd></button>
+          <button class="tab" role="tab" data-view="chips">Chips <kbd>c</kbd></button>
+          <button class="tab" role="tab" data-view="staff">Crew <kbd>h</kbd></button>
+          <button class="tab" role="tab" data-view="sites">Data Centers <kbd>d</kbd></button>
+          <button class="tab" role="tab" data-view="board" id="tabBoard">Board <kbd>b</kbd></button>
+        </div>
+        <h2 id="shopTitle"></h2>
+        <div id="shop"></div>
+      </div>
+    </aside>
+  </main>
+  <button id="alert" data-act="fix" hidden></button>
+  <div id="hint"></div>
+</div>
+<div id="dlg" role="dialog" aria-modal="true" aria-labelledby="dlgTitle" hidden>
+  <div id="dlgBox">
+    <h3 id="dlgTitle"></h3>
+    <p id="dlgBody"></p>
+    <input id="dlgInput" type="text" autocomplete="off" spellcheck="false" aria-label="Name" hidden>
+    <div id="dlgError" role="alert"></div>
+    <div id="dlgList"></div>
+    <div id="dlgKeys"></div>
+  </div>
+</div>
+<script src="core.js"></script>
+<script src="ui.js"></script>
+</body>
+</html>
