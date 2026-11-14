@@ -1,7 +1,11 @@
 """Animation: time-based and deterministic (the clock is patched), smooth frame to frame,
 and completely idle in a background pane / old data center / with DC_ANIM=0."""
 import asyncio
+import io
 import math
+import re
+
+from rich.color import Color
 
 from helpers import AppCase, game, world_save
 
@@ -618,9 +622,102 @@ def force_full_render(app: object) -> None:
     app.draw_hall()  # type: ignore[attr-defined]
 
 
+class Term:
+    """A tiny terminal: applies the escape sequences the game really sends (cursor moves and
+    truecolor SGR) to a grid of (char, fg, bg), so tests can see what reaches the screen."""
+
+    TOKEN = re.compile(r"\x1b\[(\d+);(\d+)H|\x1b\[([0-9;]*)m|(\x1b\[[^\x1b]*?[A-Za-z])|([^\x1b])")
+
+    def __init__(self) -> None:
+        self.cells: dict[tuple[int, int], tuple[str, game.RGB | None, game.RGB | None]] = {}
+        self.sent = 0  # bytes since the last reset
+
+    def reset(self, strips: list[object]) -> None:
+        self.cells = {}
+        for y, strip in enumerate(strips):
+            x = 0
+            for seg in strip:  # type: ignore[attr-defined]
+                st = seg.style
+                fg = st.color.get_truecolor() if st and st.color else None
+                bg = st.bgcolor.get_truecolor() if st and st.bgcolor else None
+                for ch in seg.text:
+                    self.cells[(x, y)] = (ch, fg, bg)
+                    x += 1
+
+    def feed(self, text: str) -> None:
+        x = y = 0
+        fg = bg = None
+        for m in self.TOKEN.finditer(text):
+            if m.group(1):
+                y, x = int(m.group(1)) - 1, int(m.group(2)) - 1
+            elif m.group(3) is not None:
+                codes = [int(c) for c in m.group(3).split(";") if c] or [0]
+                i = 0
+                while i < len(codes):
+                    c = codes[i]
+                    if c == 0:
+                        fg = bg = None
+                    elif c in (38, 48):  # 38;2;r;g;b  or  38;5;n
+                        two = codes[i + 1:i + 2] == [2]
+                        rgb = (tuple(codes[i + 2:i + 5]) if two
+                               else Color.from_ansi(codes[i + 2]).get_truecolor())
+                        fg, bg = (rgb, bg) if c == 38 else (fg, rgb)
+                        i += 4 if two else 2
+                    elif 30 <= c <= 37 or 90 <= c <= 97:
+                        fg = Color.from_ansi(c - 30 if c < 90 else c - 82).get_truecolor()
+                    elif 40 <= c <= 47 or 100 <= c <= 107:
+                        bg = Color.from_ansi(c - 40 if c < 100 else c - 92).get_truecolor()
+                    i += 1
+            elif m.group(5) and m.group(5) not in "\r\n":
+                self.cells[(x, y)] = (m.group(5), fg, bg)  # type: ignore[assignment]
+                x += 1
+        self.sent += len(text)
+
+
+def install_term(case: AnimCase) -> Term:
+    """Route every compositor update of this test through a Term, via the same
+    game.CroppedChops that the app's _display puts on the wire."""
+    from rich.console import Console
+    from textual._compositor import ChopsUpdate, Compositor
+    term, orig = Term(), Compositor.render_update
+
+    def hooked(comp: object, *a: object, **k: object) -> object:
+        update = orig(comp, *a, **k)  # type: ignore[arg-type]
+        if type(update) is ChopsUpdate:
+            wire = game.crop_update(update)
+            console = Console(color_system="truecolor", force_terminal=True, width=500, file=io.StringIO())
+            term.feed(wire.render_segments(console))
+        elif update is not None:  # a full repaint: the screen is whatever the strips say
+            term.reset(comp.render_strips())  # type: ignore[attr-defined]
+        return update
+
+    Compositor.render_update = hooked  # type: ignore[method-assign]
+    case.addCleanup(lambda: setattr(Compositor, "render_update", orig))
+    return term
+
+
+def term_cells(term: Term, app: object) -> list[list[tuple[str, game.RGB | None, game.RGB | None]]]:
+    """The Hall's content region as the simulated terminal shows it."""
+    reg = app.query_one(game.Hall).content_region  # type: ignore[attr-defined]
+    blank = (" ", None, None)
+    return [[term.cells.get((reg.x + x, reg.y + y), blank) for x in range(reg.width)]
+            for y in range(reg.height)]
+
+
+def same_picture(a: list[list[tuple[str, object, object]]],
+                 b: list[list[tuple[str, object, object]]]) -> bool:
+    """Same characters everywhere and the same colours on every picture cell (padding keeps
+    the terminal's default colours, which a terminal simulation does not resolve)."""
+    return len(a) == len(b) and all(
+        len(ra) == len(rb) and all(ca[0] == cb[0] and (ca[0] != "▀" or ca == cb)
+                                   for ca, cb in zip(ra, rb))
+        for ra, rb in zip(a, b))
+
+
 class Paint(AnimCase):
     def setUp(self) -> None:
         super().setUp()
+        self.term = install_term(self)
         orig = game.DataCenter.tick  # no real 1 s tick mid-comparison: the picture must hold still
         game.DataCenter.tick = lambda self: None  # type: ignore[method-assign]
         self.addCleanup(lambda: setattr(game.DataCenter, "tick", orig))
@@ -643,9 +740,11 @@ class Paint(AnimCase):
                         self.assertEqual((ch, fg, bg), (wch, wfg, wbg), (label, y, x))
                 if ch == " ":  # padding / scrollbar: a background, never "no colour"
                     self.assertIsNotNone(bg, (label, y, x))
+        self.assertTrue(same_picture(term_cells(self.term, app), cached), ("terminal", label))
         force_full_render(app)
         await pilot.pause(0.15)  # type: ignore[attr-defined]
         self.assertEqual(screen_cells(app), cached, label)
+        self.assertTrue(same_picture(term_cells(self.term, app), cached), ("terminal, full", label))
 
     async def test_cached_output_has_colour_and_equals_a_full_render(self) -> None:
         big = [200, 100, 50, 30, 20] + [0] * (N - 5)
@@ -717,3 +816,221 @@ class Paint(AnimCase):
             self.assertEqual(painted, changed)
             self.assertLess(len(painted), len(after))  # not every row
             self.assertTrue(all(r.height == 1 for r in regions))
+
+
+class Spans(AnimCase):
+    """Partial repaints: only the changed cells, LEDs on a slower beat, fewer LED shades."""
+
+    def test_changed_spans_join_near_neighbours_only(self) -> None:
+        cell = lambda v: ("▀", (v, v, v), None)  # noqa: E731
+        old = [cell(0)] * 12
+        new = list(old)
+        for x in (1, 2, 5, 11):  # 3,4 unchanged between 2 and 5: within the gap of 2
+            new[x] = cell(9)
+        self.assertEqual(game.Hall.changed_spans(old, new, gap=2), [(1, 6), (11, 12)])
+        self.assertEqual(game.Hall.changed_spans(old, new, gap=0), [(1, 3), (5, 6), (11, 12)])
+        self.assertEqual(game.Hall.changed_spans(old, old), [])
+        self.assertEqual(game.Hall.changed_spans(old, old[:9]), [(0, 12)])  # a width change: all of it
+
+    async def test_regions_are_exactly_the_changed_cells_plus_small_gaps(self) -> None:
+        async with self.run_app(live_save()) as (app, pilot):
+            hall = app.query_one(game.Hall)
+            regions: list[game.Region] = []
+            orig = game.Hall.refresh
+            game.Hall.refresh = lambda self, *r, **k: (regions.extend(r), orig(self, *r, **k))[1]  # type: ignore
+            self.addCleanup(lambda: setattr(game.Hall, "refresh", orig))
+            for _ in range(8):
+                regions.clear()
+                before = [list(r) for r in hall._cells]
+                self.frame(app, 1 / 12)
+                changed = {(x, y) for y, (a, b) in enumerate(zip(before, hall._cells))
+                           for x, (ca, cb) in enumerate(zip(a, b)) if ca != cb}
+                covered = {(r.x + i, r.y) for r in regions for i in range(r.width)}
+                self.assertTrue(changed <= covered)  # nothing stale
+                self.assertTrue(all(r.height == 1 and r.width >= 1 for r in regions))
+                self.assertLess(len(covered), 4 * len(changed) + 1)  # and not much extra
+                self.assertLess(len(covered), len(hall._cells) * len(hall._cells[0]) // 4)
+
+    async def test_wire_bytes_per_frame_are_small(self) -> None:
+        term = install_term(self)
+        async with self.run_app(live_save(site_owned=[[40, 0, 0, 0, 0] + [0] * (N - 5)]), size=(120, 36)) as (app, pilot):
+            await pilot.pause(0.2)
+            term.sent = 0
+            for _ in range(24):
+                self.frame(app, 1 / 12)
+                await pilot.pause(0.02)
+            per_frame = term.sent / 24
+            # whole-row repaints cost about 19 KB a frame here (timer frames add noise)
+            self.assertLess(per_frame, 12_000, per_frame)
+
+    def test_led_shade_has_four_levels(self) -> None:
+        shades = {game.Hall.led_shade(i, y, x, k / 12) for i in range(8) for y in range(6)
+                  for x in range(6) for k in range(120)}
+        self.assertEqual(shades, {0.0, 1 / 3, 2 / 3, 1.0})
+        self.assertEqual(game.LED_LEVELS, 4)
+        for i in range(30):  # still a fade: neighbouring frames never jump more than one step
+            a, b = (game.Hall.led_shade(1, 2, 3, i / 12), game.Hall.led_shade(1, 2, 3, (i + 1) / 12))
+            self.assertLessEqual(abs(a - b), 2 / 3 + 1e-9)
+
+    async def test_leds_and_glow_tick_slower_than_the_pulse(self) -> None:
+        async with self.run_app(live_save()) as (app, _):
+            hall = app.query_one(game.Hall)
+            self.assertAlmostEqual(game.SLOW_HZ * round(game.ANIM_FPS / game.SLOW_FPS), game.ANIM_FPS)
+            slot = 1 / game.SLOW_HZ
+            base = math.floor(self.t * game.SLOW_HZ) / game.SLOW_HZ + 0.01
+            orig_bus = game.Hall.draw_bus
+            game.Hall.draw_bus = lambda *a, **k: None  # type: ignore[method-assign]
+            self.addCleanup(lambda: setattr(game.Hall, "draw_bus", orig_bus))
+            app.now = base
+            first = hall.build_cells()
+            app.now = base + slot * 0.8  # same slow slot: LEDs and glow cannot move
+            self.assertEqual(hall.build_cells(), first)
+            moved = 0
+            for k in range(1, 12):  # later slots: the LEDs do change
+                app.now = base + k * slot
+                moved += hall.build_cells() != first
+            self.assertGreater(moved, 6)
+            game.Hall.draw_bus = orig_bus  # the data pulse is not slowed: it moves within a slot
+            app.now = base
+            a = hall.build_cells()
+            app.now = base + slot * 0.5
+            self.assertNotEqual(hall.build_cells(), a)
+
+    async def test_crop_update_only_touches_partial_updates(self) -> None:
+        from textual._compositor import ChopsUpdate
+        marker = object()
+        self.assertIs(game.crop_update(marker), marker)
+        self.assertIs(game.crop_update(None), None)
+        chops = ChopsUpdate([{0: None}], [(0, 0, 1)], [[1]])
+        self.assertIsInstance(game.crop_update(chops), game.CroppedChops)
+
+
+class CropGate(AnimCase):
+    """CroppedChops leans on private Textual pieces: it must switch itself off (and never
+    break painting) outside the tested Textual range or when those pieces look different."""
+
+    def test_version_parsing(self) -> None:
+        ok = ["8.0", "8.0.0", "8.2.7", "8.2", "8.2.7.dev1", " 8.2.1 ", "8.2rc1"]
+        bad = ["7.9.9", "8.3", "8.3.0", "9.0", "10.0.0", "", "garbage", "8", "8.x", "v8.2", "-8.2", "8..2"]
+        for raw in ok:
+            self.assertTrue(game.textual_in_range(raw), raw)
+        for raw in bad + [None, 8.2, b"8.2"]:  # type: ignore[list-item]
+            self.assertFalse(game.textual_in_range(raw), raw)  # type: ignore[arg-type]
+
+    def test_gate_checks_version_and_shapes(self) -> None:
+        from textual._compositor import ChopsUpdate, CompositorUpdate
+        from textual.app import App
+        args = (ChopsUpdate, CompositorUpdate, App)
+        self.assertTrue(game.crop_supported("8.2.7", *args))
+        self.assertTrue(game.CROP_OK)  # the installed Textual is inside the tested range
+        self.assertFalse(game.crop_supported("9.0.0", *args))
+        self.assertFalse(game.crop_supported("not a version", *args))
+        self.assertFalse(game.crop_supported("", *args))
+        self.assertFalse(game.crop_supported("8.2.7", None, CompositorUpdate, App))  # import failed
+        self.assertFalse(game.crop_supported("8.2.7", ChopsUpdate, None, App))
+
+        class NoEnds:  # a ChopsUpdate that lost chop_ends
+            def __init__(self, chops: object, spans: object) -> None: ...
+            def render_segments(self, console: object) -> str: return ""
+
+        class OtherDisplay:  # an App whose _display changed
+            def _display(self, screen: object, renderable: object, extra: object) -> None: ...
+
+        self.assertFalse(game.crop_supported("8.2.7", NoEnds, CompositorUpdate, App))
+        self.assertFalse(game.crop_supported("8.2.7", ChopsUpdate, CompositorUpdate, OtherDisplay))
+        self.assertFalse(game.crop_supported("8.2.7", ChopsUpdate, CompositorUpdate, object()))
+
+    def test_crop_update_uses_stock_updates_when_off_or_odd(self) -> None:
+        from textual._compositor import ChopsUpdate
+        chops = ChopsUpdate([{0: None}], [(0, 0, 1)], [[1]])
+        self.assertIsInstance(game.crop_update(chops), game.CroppedChops)
+        game.CROP_OK = False
+        self.addCleanup(lambda: setattr(game, "CROP_OK", True))
+        self.assertIs(game.crop_update(chops), chops)
+        game.CROP_OK = True
+        del chops.chop_ends  # a Textual that dropped the attribute
+        self.assertIs(game.crop_update(chops), chops)
+        saved = game.CompositorUpdate
+        game.CompositorUpdate = None
+        self.addCleanup(lambda: setattr(game, "CompositorUpdate", saved))
+        self.assertIs(game.crop_update(chops), chops)
+
+    def test_a_failing_crop_falls_back_to_the_stock_output(self) -> None:
+        class Stock:
+            spans = [(0, 0, 1)]  # no chops / chop_ends: the crop itself raises
+            def render_segments(self, console: object) -> str: return "STOCK"
+
+        self.assertEqual(game.CroppedChops(Stock()).render_segments(object()), "STOCK")
+
+    def test_crop_sends_exactly_the_span(self) -> None:
+        """Independent of the app and its frames: a known strip, a known span, exact cells."""
+        from rich.console import Console
+        from rich.segment import Segment
+        from rich.style import Style
+        from textual._compositor import ChopsUpdate
+        from textual.strip import Strip
+
+        def strip(offset: int) -> Strip:  # ten one-cell pieces, each its own colour
+            return Strip([Segment(chr(65 + i), Style.parse(f"rgb({10 * i + 10},0,0) on rgb(0,{i + 1},0)"))
+                          for i in range(10)])
+
+        console = Console(color_system="truecolor", force_terminal=True, width=500, file=io.StringIO())
+        for x0, span in ((0, (3, 6)), (4, (6, 9)), (2, (2, 12)), (2, (0, 5)), (0, (0, 10))):
+            update = ChopsUpdate([{x0: strip(x0)}, {x0: strip(x0)}], [(1, span[0], span[1])], [[x0 + 10]] * 2)
+            term = Term()
+            term.feed(game.CroppedChops(update).render_segments(console))
+            lo, hi = max(x0, span[0]), min(x0 + 10, span[1])
+            self.assertEqual(sorted(x for x, y in term.cells), list(range(lo, hi)), (x0, span))
+            self.assertTrue(all(y == 1 for x, y in term.cells))
+            for x in range(lo, hi):
+                i = x - x0
+                self.assertEqual(term.cells[(x, 1)],
+                                 (chr(65 + i), (10 * i + 10, 0, 0), (0, i + 1, 0)), (x0, span, x))
+
+
+class PaintStock(AnimCase):
+    """With the crop gated off, or failing, the picture is still exactly a full render."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        orig = game.DataCenter.tick
+        game.DataCenter.tick = lambda self: None  # type: ignore[method-assign]
+        self.addCleanup(lambda: setattr(game.DataCenter, "tick", orig))
+        self.term = install_term(self)
+        self.check = Paint.check.__get__(self)  # reuse the equivalence check
+
+    async def flows(self, mode: str) -> None:
+        big = [200, 100, 50, 30, 20] + [0] * (N - 5)
+        async with self.run_app(live_save(site_owned=[big], site_balance=[10**12])) as (app, pilot):
+            await self.check(app, pilot, f"{mode} idle")
+            app.add_fx("float", game.FLOAT_LIFE_S, text="+$1.00K")
+            for _ in range(5):
+                self.frame(app, 1 / 12)
+                await self.check(app, pilot, f"{mode} frame")
+            for key in ("pagedown", "home"):
+                await pilot.press(key)
+                await self.check(app, pilot, f"{mode} {key}")
+            await pilot.resize_terminal(80, 24)
+            await pilot.pause(0.2)
+            await self.check(app, pilot, f"{mode} resize")
+
+    async def test_unsupported_textual_version(self) -> None:
+        game.CROP_OK = game.crop_supported("9.0.0", game.ChopsUpdate, game.CompositorUpdate, game.App)
+        self.addCleanup(lambda: setattr(game, "CROP_OK", True))
+        self.assertFalse(game.CROP_OK)
+        await self.flows("textual 9.0")
+
+    async def test_garbage_version(self) -> None:
+        game.CROP_OK = game.crop_supported("garbage", game.ChopsUpdate, game.CompositorUpdate, game.App)
+        self.addCleanup(lambda: setattr(game, "CROP_OK", True))
+        self.assertFalse(game.CROP_OK)
+        await self.flows("garbage version")
+
+    async def test_crop_that_raises_falls_back(self) -> None:
+        def boom(self: object, console: object) -> str:
+            raise RuntimeError("private API changed")
+
+        orig = game.CroppedChops.cropped
+        game.CroppedChops.cropped = boom  # type: ignore[method-assign]
+        self.addCleanup(lambda: setattr(game.CroppedChops, "cropped", orig))
+        await self.flows("raising crop")

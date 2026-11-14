@@ -4,6 +4,7 @@ Colours follow the active Textual theme (ctrl+p -> Change theme)."""
 import argparse
 import colorsys
 import http.client
+import inspect
 import json
 import math
 import os
@@ -22,6 +23,7 @@ from itertools import accumulate, groupby
 from pathlib import Path
 from typing import Any, ClassVar, cast
 
+from rich.control import Control
 from rich.segment import Segment
 from rich.style import Style
 from rich.text import Text
@@ -38,6 +40,16 @@ from textual.widget import Widget
 from textual.widgets import Input, RichLog, Static
 
 from . import __version__
+
+try:  # Textual internals, used only to trim what a partial repaint sends (see crop_update)
+    from textual._compositor import ChopsUpdate, CompositorUpdate
+except ImportError:  # an unknown Textual: its own (wider) updates are fine, just bigger
+    ChopsUpdate = CompositorUpdate = None  # type: ignore[assignment, misc]
+try:
+    from importlib.metadata import version as _dist_version
+    TEXTUAL_VERSION = _dist_version("textual")
+except Exception:  # noqa: BLE001 - metadata missing or odd: the gate below turns the trim off
+    TEXTUAL_VERSION = ""
 
 RGB = tuple[int, int, int]
 
@@ -215,6 +227,11 @@ RELOC_S, RELOC_STAGGER_S, RELOC_FADE_S = 1.6, 0.25, 0.45
 LED_SLOT_S, LED_FADE = 0.6, 0.5  # an LED re-rolls every slot and fades over half of it
 PULSE_PX_S, PULSE_TAIL = 16.0, 5.0  # data pulse speed (pixels/s) and tail length
 TOP_PERIOD_S, BANNER_PERIOD_S, PULSE_STEPS = 3.0, 1.2, 8  # PULSE_STEPS quantises the top-tier glow
+# Bandwidth (the game is played over SSH): LEDs and the glow move at SLOW_FPS (about, it is a
+# whole fraction of the frame rate), the LED fade has LED_LEVELS brightness steps, and a repaint
+# sends only the changed cells; spans closer than SPAN_GAP unchanged cells are sent as one.
+SLOW_FPS, LED_LEVELS, SPAN_GAP = 6.0, 4, 2
+SLOW_HZ = ANIM_FPS / max(1, round(ANIM_FPS / SLOW_FPS))  # every n-th frame: no uneven beat
 
 
 def clock() -> float:
@@ -631,6 +648,7 @@ class Palette:
 # --------------------------------------------------------------------- hall
 
 Run = tuple[str, "RGB | None", "RGB | None"]  # a stretch of text with its fg / bg colour
+Cell = tuple[str, "RGB | None", "RGB | None"]  # one terminal cell: char, fg, bg
 
 
 class StyleCache(dict[tuple["RGB | None", "RGB | None"], Style]):
@@ -650,7 +668,8 @@ class Hall(Widget):
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
-        self._rows: list[list[Run]] | None = None  # last picture, for row-level repaints
+        self._rows: list[list[Run]] | None = None  # last picture, for partial repaints
+        self._cells: list[list[Cell]] = []  # the same picture cell by cell (to find what changed)
         self._strips: dict[int, Strip] = {}
         self._base_key: tuple[Any, ...] | None = None
         self._base: tuple[list[list[RGB]], list[tuple[int, int, int, int]]] = ([], [])
@@ -692,6 +711,13 @@ class Hall(Widget):
         now = 1.0 if mix32(idx, key, k) % 5 < 2 else 0.0
         before = 1.0 if mix32(idx, key, k - 1) % 5 < 2 else 0.0
         return before + (now - before) * smoothstep((s - k) / LED_FADE)
+
+    @classmethod
+    def led_shade(cls, idx: int, y: int, x: int, t: float) -> float:
+        """led_level snapped to LED_LEVELS brightness steps: the fade stays smooth to the eye
+        but far fewer LED cells change from one frame to the next."""
+        steps = LED_LEVELS - 1
+        return round(cls.led_level(idx, y, x, t) * steps) / steps
 
     def render_reloc(self) -> Text:
         """The relocation transition: lines fade in one after another, then all fade out."""
@@ -822,18 +848,20 @@ class Hall(Widget):
             return Text("\n  Empty hall. Press 1 to buy your first server.", style=rgb(p.muted))
         return None
 
-    def build_rows(self) -> list[list[Run]]:
-        """The picture as rows of runs (text, fg, bg): pixel hall, effects and scrollbar."""
+    def build_cells(self) -> list[list[Cell]]:
+        """The picture, one (char, fg, bg) cell at a time: pixel hall, effects, scrollbar.
+        Rows are gw cells wide (gw + padding + scrollbar when the hall scrolls)."""
         game, p = self.game, self.game.pal
         total, animating = sum(game.owned), game.animating
         w, t = self.size.width, game.now
+        slow = math.floor(t * SLOW_HZ) / SLOW_HZ  # LEDs and glow tick slower than the pulse
         cols, view_rows, total_rows, start = self.rack_layout()
         first = start * cols
         shown = min(total - first, view_rows * cols)
         ends = list(accumulate(game.owned))  # racks are ordered by tier: find each one's tier
         gw, gh = cols * CELL_W, view_rows * CELL_H
         dead = game.read_only
-        pulse = round(PULSE_STEPS * sine01(t, TOP_PERIOD_S)) if animating else 0
+        pulse = round(PULSE_STEPS * sine01(slow, TOP_PERIOD_S)) if animating else 0
         key = (game.pal_serial, tuple(game.owned), game.top_tier(), first, shown, cols, view_rows, dead,
                animating, pulse)
         if self._base_key != key:  # sprites only change when the layout or the pulse step does
@@ -848,7 +876,7 @@ class Hall(Widget):
             led_on = led_off = mix(p.frame, p.bg, 0.4)
         for x, y, idx, pos in leds:
             if animating:
-                grid[y][x] = mix(led_off, led_on, self.led_level(idx, pos // 8, pos % 8, t))
+                grid[y][x] = mix(led_off, led_on, self.led_shade(idx, pos // 8, pos % 8, slow))
             else:
                 grid[y][x] = led_on if self.led_lit(idx, pos // 8, pos % 8) else led_off
         if animating:
@@ -865,16 +893,21 @@ class Hall(Widget):
         cells = [[("▀", grid[y][x], grid[y + 1][x]) for x in range(gw)] for y in range(0, gh, 2)]
         if animating:
             self.draw_floats(cells)
-        rows: list[list[Run]] = []
-        for line, row in enumerate(cells):
-            # Merge runs of identical cells into single segments: far fewer bytes per frame.
-            runs: list[Run] = [(ch * len(list(run)), fg, bg) for (ch, fg, bg), run in groupby(row)]
-            if scrolled:
-                runs.append((" " * max(0, w - gw - 1), None, None))
+        if scrolled:
+            for line, row in enumerate(cells):
+                row.extend([(" ", None, None)] * max(0, w - gw - 1))
                 thumb = thumb_pos <= line < thumb_pos + thumb_len
-                runs.append((" ", None, p.muted if thumb else p.frame))
-            rows.append(runs)
-        return rows
+                row.append((" ", None, p.muted if thumb else p.frame))
+        return cells
+
+    @staticmethod
+    def to_runs(row: list[Cell]) -> list[Run]:
+        """Merge runs of identical cells into single segments: far fewer bytes per frame."""
+        return [(ch * len(list(run)), fg, bg) for (ch, fg, bg), run in groupby(row)]
+
+    def build_rows(self) -> list[list[Run]]:
+        """The picture as rows of runs (text, fg, bg)."""
+        return [self.to_runs(row) for row in self.build_cells()]
 
     def render(self) -> Text:
         text = self.special()
@@ -888,25 +921,43 @@ class Hall(Widget):
             out.append("\n")
         return out
 
-    # -- partial repaints: only the terminal rows that changed are rendered again --------
+    # -- partial repaints: only the cells that changed are rendered and sent again ------
+
+    @staticmethod
+    def changed_spans(old: list[Cell], new: list[Cell], gap: int = SPAN_GAP) -> list[tuple[int, int]]:
+        """Half-open (start, end) column spans covering every cell that differs between two
+        rows; spans with at most `gap` unchanged cells between them are joined into one."""
+        if len(old) != len(new):  # the row's width changed (scrollbar came or went): repaint it all
+            return [(0, max(len(old), len(new)))]
+        spans: list[list[int]] = []
+        for x, (a, b) in enumerate(zip(old, new)):
+            if a == b:
+                continue
+            if spans and x - spans[-1][1] <= gap:
+                spans[-1][1] = x + 1
+            else:
+                spans.append([x, x + 1])
+        return [(a, b) for a, b in spans]
 
     def update_rows(self) -> None:
-        """Rebuild the picture and ask Textual to repaint just the rows that differ."""
+        """Rebuild the picture and ask Textual to repaint just the spans of cells that differ."""
         if self.special() is not None:  # text states go through the normal render() path
             self._rows = None
             self.refresh()
             return
-        rows = self.build_rows()
-        old = self._rows
-        self._rows = rows
+        cells = self.build_cells()
+        old, self._cells = self._cells, cells
+        had = self._rows is not None
+        self._rows = [self.to_runs(row) for row in cells]
         self._strips = {}
-        if old is None or len(old) != len(rows):
+        if not had or len(old) != len(cells):
             self.refresh()
             return
-        dirty = [Region(0, y, self.size.width, 1) for y, (a, b) in enumerate(zip(old, rows))
-                 if a != b]
-        if dirty:
-            self.refresh(*dirty)
+        regions: list[Region] = []
+        for y, (a, b) in enumerate(zip(old, cells)):
+            regions.extend(Region(x1, y, x2 - x1, 1) for x1, x2 in self.changed_spans(a, b))
+        if regions:
+            self.refresh(*regions)
 
     def render_line(self, y: int) -> Strip:
         if self._rows is None:
@@ -1009,6 +1060,73 @@ class Menu(ModalScreen[str | None]):
 
 
 # ---------------------------------------------------------------------- app
+
+CROP_TESTED = ((8, 0), (8, 3))  # Textual versions [8.0, 8.3) are the ones CroppedChops was checked on
+
+
+def textual_in_range(raw: str) -> bool:
+    """Is this Textual version string inside CROP_TESTED? Anything unparsable is not."""
+    m = re.match(r"^(\d+)\.(\d+)", raw.strip()) if isinstance(raw, str) else None
+    return bool(m) and CROP_TESTED[0] <= (int(m.group(1)), int(m.group(2))) < CROP_TESTED[1]  # type: ignore[union-attr]
+
+
+def crop_supported(raw_version: str, chops: Any, base: Any, app: Any) -> bool:
+    """May CroppedChops replace Textual's partial-repaint output? Only on a tested Textual
+    whose private pieces still look the way it expects; otherwise stock rendering is used."""
+    try:
+        if not textual_in_range(raw_version) or chops is None or base is None:
+            return False
+        if list(inspect.signature(app._display).parameters) != ["self", "screen", "renderable"]:
+            return False
+        init = list(inspect.signature(chops.__init__).parameters)
+        return init == ["self", "chops", "spans", "chop_ends"] and callable(
+            getattr(chops, "render_segments", None))
+    except Exception:  # noqa: BLE001 - any surprise means "not supported"
+        return False
+
+
+CROP_OK = crop_supported(TEXTUAL_VERSION, ChopsUpdate, CompositorUpdate, App)
+
+if CompositorUpdate is not None:
+    class CroppedChops(CompositorUpdate):  # type: ignore[misc, valid-type]
+        """A partial repaint that sends exactly the dirty cells. Textual's own ChopsUpdate
+        starts each piece at the left edge of the widget's line and only crops its right
+        end, so one changed cell re-sends everything to its left. Any failure falls back
+        to Textual's own output: this is an optimisation and must never break painting."""
+
+        def __init__(self, update: Any) -> None:
+            self.update = update
+
+        def render_segments(self, console: Any) -> str:
+            try:
+                return self.cropped(console)
+            except Exception:  # noqa: BLE001 - fall back to the stock, wider repaint
+                return str(self.update.render_segments(console))
+
+        def cropped(self, console: Any) -> str:
+            move_to = Control.move_to
+            out: list[str] = []
+            update = self.update
+            for y, x1, x2 in update.spans:
+                for end, (x, strip) in zip(update.chop_ends[y], update.chops[y].items()):
+                    lo, hi = max(x, x1), min(end, x2)
+                    if strip is None or lo >= hi:
+                        continue
+                    if (lo, hi) != (x, end):
+                        strip = strip.crop(lo - x, hi - x)
+                    out.append(move_to(lo, y).segment.text)  # every piece is placed explicitly
+                    out.append(strip.render(console))
+            return "".join(out)
+
+
+def crop_update(update: Any) -> Any:
+    """`update` with a partial repaint narrowed to its dirty cells (anything else as is,
+    and everything as is when this Textual is outside the tested range)."""
+    if (CROP_OK and CompositorUpdate is not None and type(update) is ChopsUpdate
+            and all(hasattr(update, a) for a in ("spans", "chop_ends", "chops"))):
+        return CroppedChops(update)
+    return update
+
 
 class DataCenter(App):
     TITLE = "MY DATA CENTER"
@@ -1310,6 +1428,9 @@ class DataCenter(App):
         yield Static(id="alert")
         yield Static("1-0 pick  s c h d b views  x relocate  f fix  m menu  q quit",
                      id="hint")
+
+    def _display(self, screen: Any, renderable: Any) -> None:
+        super()._display(screen, crop_update(renderable))
 
     def on_mount(self) -> None:
         self.query_one("#stats").border_title = "OVERVIEW"
