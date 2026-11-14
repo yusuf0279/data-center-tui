@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Animation and colour: blinking LEDs, data pulses and a pulsing top tier in the hall, floating `+$X`, balance flash and sparkles, a flickering crisis banner and a relocation transition. Only in a front pane and a live data center; `--no-anim` or `DC_ANIM=0` turns it all off
 - Web port of the game (`web/`), shared by the VS Code extension and the Chrome/Firefox extensions (`npm run build`)
 - Extensions can use the optional leaderboard: opt-in, sends only name, Fame and number of data centers to `data-center.openexplorer.xyz` (webview CSP and extension host permission restricted to that origin). Clearing extension storage loses the leaderboard identity token
 - Firefox extension now requires Firefox 127 or newer, so the host permission is granted at install
