@@ -16,10 +16,9 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from bisect import bisect_right
 from collections.abc import Callable
 from dataclasses import dataclass
-from itertools import accumulate, groupby
+from itertools import groupby
 from pathlib import Path
 from typing import Any, ClassVar, cast
 
@@ -218,10 +217,8 @@ def anim_fps(raw: str | None) -> float:
 
 ANIM_FPS = anim_fps(os.environ.get("DC_ANIM_FPS"))
 FRAME_S = 1 / ANIM_FPS  # seconds between frames
-BANNER_MIN_CONTRAST, FLOAT_MIN_CONTRAST = 3.0, 2.5  # WCAG ratios the fades never drop below
-MAX_FLOATS = 3  # floating +$X on screen at once
-FLOAT_ROWS, FLOAT_ROW_S = 7, 0.28  # a float rises FLOAT_ROWS rows, one per FLOAT_ROW_S on average
-FLOAT_LIFE_S = FLOAT_ROWS * FLOAT_ROW_S
+BANNER_MIN_CONTRAST = 3.0  # WCAG ratio the banner fade never drops below
+HEADER_MIN_CONTRAST = 3.0  # ... and the hall's tier headers
 SPARK_LIFE_S, RESOLVE_S, CASH_FLASH_S = 0.8, 1.0, 0.6
 RELOC_S, RELOC_STAGGER_S, RELOC_FADE_S = 1.6, 0.25, 0.45
 LED_SLOT_S, LED_FADE = 0.6, 0.5  # an LED re-rolls every slot and fades over half of it
@@ -256,11 +253,6 @@ def sine01(t: float, period: float) -> float:
     return 0.5 - 0.5 * math.cos(math.tau * t / period)
 
 
-def float_rows(age: float) -> float:
-    """Rows a floating +$X has risen after `age` seconds (ease-out, FLOAT_ROWS in total)."""
-    return FLOAT_ROWS * ease_out(age / FLOAT_LIFE_S)
-
-
 # Sprite legend: k frame, c tier colour, h highlight, d dark, w pale window/fan,
 # A/B blinking LEDs, . empty. One distinct silhouette per tier.
 SPRITES: list[list[str]] = [
@@ -290,13 +282,12 @@ def mix32(*vals: int) -> int:
 @dataclass
 class Fx:
     """One short-lived visual effect, born at clock time `born` and alive for `life` seconds.
-    `float` = rising "+$X" text; `spark` = a burst of pixels around a rack."""
+    `spark` = a burst of pixels around a rack."""
     kind: str
     seed: int
     life: float
     born: float
     tier: int = 0
-    text: str = ""
     big: bool = False
 
     def progress(self, now: float) -> float:
@@ -643,6 +634,9 @@ class Palette:
         self.alert_on = self.error
         self.alert_off = mix(self.error, self.bg, 0.8)
         self.chip_text = self.bg
+        # the empty chip pips: as dark as the shadow, and darker still on a light theme so the
+        # lit pips have room to stand out
+        self.pip_floor = self.shadow if lum(self.surface) < 0.5 else mix(self.bg, (0, 0, 0), 0.8)
 
 
 # --------------------------------------------------------------------- hall
@@ -662,9 +656,123 @@ class StyleCache(dict[tuple["RGB | None", "RGB | None"], Style]):
 
 STYLES = StyleCache()
 
+CHIP_PIPS, CHIP_STEPS = 5, 4  # a chip level (0..20) is 5 family pips of 4 editions each
+PIP_GLYPHS = "·▂▄▆█"  # a pip in the side card, by how many of its 4 editions are installed
+PIP_FULL_WHITE = 0.85  # how far towards white a full pip goes
+PIP_MIN_CONTRAST = 3.0  # the faintest lit pip against an empty one
+HEADER_LINES, RACK_LINES = 1, CELL_H // 2  # terminal lines per tier header / per rack row
+
+
+def chip_pips(level: int) -> list[int]:
+    """Fill (0..4) of each of the 5 family pips for an installed chip level: pips fill left
+    to right, one step per edition, so 0 is empty, 4 is one family and 20 is all five."""
+    return [min(CHIP_STEPS, max(0, level - CHIP_STEPS * i)) for i in range(CHIP_PIPS)]
+
+
+def lightness(c: RGB) -> float:
+    """CIE L* (0 black .. 100 white): equal steps look like equal steps of brightness."""
+    y = 0.2126 * _linear(c[0]) + 0.7152 * _linear(c[1]) + 0.0722 * _linear(c[2])
+    return 116 * (y ** (1 / 3) if y > 0.008856 else 7.787 * y + 16 / 116) - 16
+
+
+def pip_colour(step: int, hue: RGB, floor: RGB) -> RGB:
+    """One hall pip: `floor` when empty, then a tint of the tier colour that gets lighter with
+    every edition. The first edition is just PIP_MIN_CONTRAST above the floor and the last
+    is the palest tint; the steps between are evenly spaced in lightness, so each one is
+    clearly brighter than the last on any theme."""
+    if not step:
+        return floor
+    peak = mix(hue, (255, 255, 255), PIP_FULL_WHITE)
+
+    def solve(reached: Callable[[RGB], bool]) -> float:  # smallest mix that satisfies `reached`
+        lo, hi = 0.0, 1.0
+        for _ in range(14):
+            mid = (lo + hi) / 2
+            lo, hi = (lo, mid) if reached(mix(floor, peak, mid)) else (mid, hi)
+        return hi
+
+    first = mix(floor, peak, solve(lambda c: contrast(c, floor) >= PIP_MIN_CONTRAST))
+    l1, l4 = lightness(first), lightness(peak)
+    want = l1 + (l4 - l1) * (step - 1) / (CHIP_STEPS - 1)
+    return mix(floor, peak, solve(lambda c: lightness(c) >= want))
+
+
+def header_label(name: str, count: int, level: int, room: int) -> str:
+    """"NAME xN · chip L3/20", shortened step by step to fit `room` cells: the word chip goes
+    first, then the dot, then the name is cut with an ellipsis."""
+    chip = f"L{level}/{MAX_CHIP}"
+    tails = (f" x{count} · chip {chip}", f" x{count} · {chip}", f" x{count} {chip}")
+    for tail in tails:
+        if len(name) + len(tail) <= room:
+            return name + tail
+    keep = room - len(tails[-1])
+    if keep >= 4:
+        return name[:keep - 1].rstrip() + "…" + tails[-1]
+    return (name + tails[-1])[:max(0, room)]
+
+
+@dataclass
+class Block:
+    """One stretch of the hall: a tier header line or one row of racks."""
+    kind: str  # "head" or "rack"
+    tier: int
+    first: int  # index of the first rack (racks are numbered cheapest tier first)
+    count: int  # racks in this row (0 for a header)
+    line0: int  # terminal line the block starts on, counted from the top of the whole hall
+    height: int
+    row: int  # rack-row number (0-based); a header takes the number of the row below it
+
+
+@dataclass
+class Layout:
+    """Where everything in the hall goes: every tier's header and rack rows laid end to end,
+    and which of those blocks are on screen (blocks[start:end], all fully visible)."""
+    cols: int
+    height: int  # terminal lines available
+    blocks: list[Block]
+    start: int
+    end: int
+    total_lines: int
+    total_rows: int
+    tier_block: list[int]  # index of each tier's header block (-1: none owned)
+    tier_first: list[int]  # index of each tier's first rack
+
+    @property
+    def scrolled(self) -> bool:
+        return self.total_lines > self.height
+
+    @property
+    def top_line(self) -> int:
+        return self.blocks[self.start].line0 if self.blocks else 0
+
+    @property
+    def used(self) -> int:
+        """Terminal lines the visible blocks take."""
+        return sum(b.height for b in self.blocks[self.start:self.end])
+
+    @property
+    def max_start(self) -> int:
+        """The first block of the last full screen (what the hall shows while following)."""
+        s = len(self.blocks) - 1
+        while s > 0 and self.total_lines - self.blocks[s - 1].line0 <= self.height:
+            s -= 1
+        return max(0, s)
+
+    def rack_xy(self, idx: int, tier: int) -> tuple[int, int] | None:
+        """Pixel (x, y) of the top left of rack `idx` of `tier`, None if it is off screen."""
+        if self.tier_block[tier] < 0:
+            return None
+        k, c = divmod(idx - self.tier_first[tier], self.cols)
+        bi = self.tier_block[tier] + 1 + k
+        if not self.start <= bi < self.end:
+            return None
+        return c * CELL_W, (self.blocks[bi].line0 - self.top_line) * 2 + 1
+
+
 class Hall(Widget):
     """Pixel view of the racks you own, drawn with half-block characters. Racks are
-    listed by tier (cheapest first); scroll with up/down/pageup/pagedown/home/end."""
+    listed by tier (cheapest first), each tier under its own header line; scroll with
+    up/down/pageup/pagedown/home/end (one header or rack row at a time)."""
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
@@ -673,6 +781,8 @@ class Hall(Widget):
         self._strips: dict[int, Strip] = {}
         self._base_key: tuple[Any, ...] | None = None
         self._base: tuple[list[list[RGB]], list[tuple[int, int, int, int]]] = ([], [])
+        self._blocks_owned: tuple[int, ...] = ()
+        self._blocks: dict[int, tuple[list[Block], int, list[int], list[int]]] = {}  # by columns
 
     @property
     def game(self) -> "DataCenter":
@@ -681,20 +791,53 @@ class Hall(Widget):
     def on_resize(self, event: events.Resize) -> None:
         self.game.redraw()  # the title shows which rack rows fit, so it depends on our size
 
-    def rack_layout(self) -> tuple[int, int, int, int]:
-        """(columns, visible rack rows, total rack rows, first visible rack row)."""
+    def make_blocks(self, cols: int) -> tuple[list[Block], int, list[int], list[int]]:
+        """Every block of the whole hall for `cols` racks per row (cached while the fleet and
+        the width stay the same): (blocks, total lines, tier header index, tier first rack)."""
+        owned = tuple(self.game.owned)
+        if owned != self._blocks_owned:
+            self._blocks_owned, self._blocks = owned, {}
+        if cols in self._blocks:
+            return self._blocks[cols]
+        blocks: list[Block] = []
+        tier_block, tier_first = [-1] * len(owned), [0] * len(owned)
+        line = row = first = 0
+        for tier, n in enumerate(owned):
+            tier_first[tier] = first
+            if not n:
+                continue
+            tier_block[tier] = len(blocks)
+            blocks.append(Block("head", tier, first, 0, line, HEADER_LINES, row))
+            line += HEADER_LINES
+            for k in range(-(-n // cols)):
+                blocks.append(Block("rack", tier, first + k * cols, min(cols, n - k * cols),
+                                    line, RACK_LINES, row))
+                line += RACK_LINES
+                row += 1
+            first += n
+        self._blocks[cols] = (blocks, line, tier_block, tier_first)
+        return self._blocks[cols]
+
+    def rack_layout(self) -> Layout:
+        """Place the tier headers and rack rows, and pick the visible blocks: the newest at
+        the bottom unless the player scrolled (game.hall_scroll is a block number)."""
         game = self.game
-        racks = sum(game.owned)
-        w, h = self.size.width, self.size.height
-        view_rows = max(1, h // (CELL_H // 2))
+        w, height = self.size.width, max(self.size.height, HEADER_LINES + RACK_LINES)
         cols = max(1, w // CELL_W)
-        total_rows = -(-racks // cols)
-        if total_rows > view_rows:  # a scrollbar needs one column of its own
+        blocks, total, tier_block, tier_first = self.make_blocks(cols)
+        if total > height:  # a scrollbar needs one column of its own
             cols = max(1, (w - 1) // CELL_W)
-            total_rows = -(-racks // cols)
-        max_start = max(0, total_rows - view_rows)
-        start = max_start if game.hall_scroll is None else min(game.hall_scroll, max_start)
-        return cols, view_rows, total_rows, start
+            blocks, total, tier_block, tier_first = self.make_blocks(cols)
+        lay = Layout(cols, height, blocks, 0, 0, total, sum(b.kind == "rack" for b in blocks),
+                     tier_block, tier_first)
+        lay.start = lay.max_start if game.hall_scroll is None else min(game.hall_scroll, lay.max_start)
+        lay.end, used = lay.start, 0
+        while lay.end < len(blocks) and used + blocks[lay.end].height <= height:
+            used += blocks[lay.end].height
+            lay.end += 1
+        if lay.end - 1 > lay.start and blocks[lay.end - 1].kind == "head":
+            lay.end -= 1  # a header never ends the screen without a rack row under it
+        return lay
 
     @staticmethod
     def led_lit(idx: int, y: int, x: int) -> bool:
@@ -743,27 +886,27 @@ class Hall(Widget):
             out.append("\n")
         return out
 
-    def draw_bus(self, grid: list[list[RGB]], first: int, shown: int, cols: int,
-                 ends: list[int], t: float) -> None:
+    def draw_bus(self, grid: list[list[RGB]], lay: Layout, t: float) -> None:
         """A cable along the top of every rack row with a data pulse gliding down it. The
         head sits at a fractional pixel: its two neighbours share the colour in proportion,
         so it moves continuously rather than in cell steps."""
         p = self.game.pal
-        for r in range(-(-shown // cols)):
-            width = min(cols, shown - r * cols) * CELL_W - 1
-            row = grid[r * CELL_H]
+        for b in lay.blocks[lay.start:lay.end]:
+            if b.kind != "rack":
+                continue
+            width = b.count * CELL_W - 1
+            row = grid[(b.line0 - lay.top_line) * 2]
             for x in range(0, width, 2):
                 row[x] = p.frame
-            head = (t * PULSE_PX_S + r * 9) % (width + PULSE_TAIL)
+            head = (t * PULSE_PX_S + b.row * 9) % (width + PULSE_TAIL)
+            colour = p.tiers[b.tier]
             for x in range(max(0, math.ceil(head - PULSE_TAIL)), min(width, int(head) + 2)):
                 d = head - x  # distance behind the head; the leading edge blends in
                 a = 1 + d if d < 0 else (1 - d / PULSE_TAIL) ** 2
                 if a > 0:
-                    colour = p.tiers[bisect_right(ends, first + r * cols + x // CELL_W)]
                     row[x] = mix(row[x], colour, min(1.0, a))
 
-    def draw_sparks(self, grid: list[list[RGB]], first: int, shown: int, cols: int,
-                    ends: list[int]) -> None:
+    def draw_sparks(self, grid: list[list[RGB]], lay: Layout) -> None:
         """Sparkle bursts around the rack that was just bought (hall centre if off screen):
         the sparks fly out with ease-out and fade smoothly."""
         game, p = self.game, self.game.pal
@@ -772,9 +915,9 @@ class Hall(Widget):
             if fx.kind != "spark":
                 continue
             u = fx.progress(game.now)
-            j = ends[fx.tier] - 1 - first if game.owned[fx.tier] else -1
-            cx, cy = (((j % cols) * CELL_W + 3, (j // cols) * CELL_H + 4) if 0 <= j < shown
-                      else (gw // 2, gh // 2))
+            at = (lay.rack_xy(lay.tier_first[fx.tier] + game.owned[fx.tier] - 1, fx.tier)
+                  if game.owned[fx.tier] else None)
+            cx, cy = (at[0] + 3, at[1] + 3) if at else (gw // 2, gh // 2)
             base = p.warning if fx.big else mix(p.tiers[fx.tier], p.fg, 0.5)
             colour = mix(base, p.bg, smoothstep(u))
             for i in range(20 if fx.big else 9):
@@ -785,59 +928,68 @@ class Hall(Widget):
                 if 0 <= x < gw and 0 <= y < gh:
                     grid[y][x] = colour
 
-    def draw_floats(self, cells: list[list[tuple[str, RGB, RGB]]]) -> None:
-        """Rising "+$X" text over the hall: it climbs with ease-out and fades near the top."""
+    def base_grid(self, lay: Layout, pulse: int) -> tuple[list[list[RGB]], list[tuple[int, int, int, int]]]:
+        """Everything that doesn't move: backdrop, sprites, chip pips. Also the LED pixels as
+        (x, y, rack index, sprite position). Cached; see build_cells()."""
         game, p = self.game, self.game.pal
-        gw = len(cells[0])
-        for fx in game.fx:
-            if fx.kind != "float":
-                continue
-            u = fx.progress(game.now)
-            y = len(cells) - 2 - round(float_rows(u * FLOAT_LIFE_S))
-            if y < 0:
-                continue
-            x0 = 1 + mix32(fx.seed, 1) % max(1, gw - len(fx.text) - 1)
-            colour = mix(p.success, p.bg, 0.5 * smoothstep((u - 0.5) / 0.5))
-            for i, ch in enumerate(fx.text[:gw - x0]):
-                under = cells[y][x0 + i][2]
-                cells[y][x0 + i] = (ch, ensure_contrast(colour, under, FLOAT_MIN_CONTRAST), under)
-
-    def base_grid(self, first: int, shown: int, cols: int, view_rows: int, ends: list[int],
-                  pulse: int) -> tuple[list[list[RGB]], list[tuple[int, int, int, int]]]:
-        """Everything that doesn't move: backdrop, sprites, shadows. Also the LED pixels as
-        (x, y, rack index, sprite position). Cached; see render()."""
-        game, p = self.game, self.game.pal
-        gw, gh = cols * CELL_W, view_rows * CELL_H
+        gw, gh = lay.cols * CELL_W, lay.used * 2
         grid: list[list[RGB]] = [
             [mix(p.bg, p.surface, y / max(1, gh - 1))] * gw for y in range(gh)
         ]
         leds: list[tuple[int, int, int, int]] = []
-        dead, top = game.read_only, game.top_tier()
-        for j in range(shown):
-            idx = first + j
-            tier = bisect_right(ends, idx)
-            ox, oy = (j % cols) * CELL_W, (j // cols) * CELL_H + 1
-            colour = p.tiers[tier]
+        top = game.top_tier()
+        for b in lay.blocks[lay.start:lay.end]:
+            if b.kind != "rack":
+                continue
+            tier, oy = b.tier, (b.line0 - lay.top_line) * 2 + 1
+            hue = self.tier_colour(tier)
+            colour = hue
             if game.animating and tier == top:  # gentle pulse on the best earner
                 colour = mix(colour, p.fg, 0.25 * pulse / PULSE_STEPS)
-            if dead:  # washed out to grey
-                grey = int(lum(colour) * 255)
-                colour = mix((grey, grey, grey), p.surface, 0.55)
             palette: dict[str, RGB] = {
                 "k": p.frame, "c": colour, "h": mix(colour, (255, 255, 255), 0.35),
                 "d": mix(colour, (0, 0, 0), 0.5), "w": mix(colour, (255, 255, 255), 0.6),
             }
-            for x in range(1, 6):  # soft floor shadow
-                grid[oy + 6][ox + x] = p.shadow
-            for y, row in enumerate(SPRITES[tier]):
-                for x, ch in enumerate(row):
-                    if ch == ".":
-                        continue
-                    if ch in "AB":
-                        leds.append((ox + x, oy + y, idx, y * 8 + x))
-                    else:
-                        grid[oy + y][ox + x] = palette[ch]
+            pips = [pip_colour(s, hue, p.pip_floor) for s in chip_pips(game.chips[tier])]
+            for c in range(b.count):
+                ox, idx = c * CELL_W, b.first + c
+                for x, pip in enumerate(pips):  # the floor shadow row doubles as the chip level
+                    grid[oy + 6][ox + 1 + x] = pip
+                for y, row in enumerate(SPRITES[tier]):
+                    for x, ch in enumerate(row):
+                        if ch == ".":
+                            continue
+                        if ch in "AB":
+                            leds.append((ox + x, oy + y, idx, y * 8 + x))
+                        else:
+                            grid[oy + y][ox + x] = palette[ch]
         return grid, leds
+
+    def tier_colour(self, tier: int) -> RGB:
+        """A tier's colour in this hall: washed out to grey in a decommissioned one."""
+        p, colour = self.game.pal, self.game.pal.tiers[tier]
+        if self.game.read_only:
+            grey = int(lum(colour) * 255)
+            return mix((grey, grey, grey), p.surface, 0.55)
+        return colour
+
+    def header_cells(self, b: Block, width: int, under: RGB) -> list[Cell]:
+        """One tier's header line: its buy key as a badge, then "NAME xN · chip L3/20" in the
+        tier colour (contrast against the backdrop kept at HEADER_MIN_CONTRAST) and a rule."""
+        game, p = self.game, self.game.pal
+        colour = self.tier_colour(b.tier)
+        key = (b.tier + 1) % 10  # the number key that buys this tier
+        badge_fg = ensure_contrast(p.chip_text, colour, HEADER_MIN_CONTRAST)
+        text_fg = ensure_contrast(colour, under, HEADER_MIN_CONTRAST)
+        label = header_label(TIERS[b.tier][0].upper(), game.owned[b.tier], game.chips[b.tier],
+                             width - 4)
+        cells: list[Cell] = [(ch, badge_fg, colour) for ch in f" {key} "]
+        cells.append((" ", None, under))
+        cells.extend((ch, text_fg, under) for ch in label)
+        if len(cells) < width:
+            cells.append((" ", None, under))
+        cells.extend(("─", p.frame, under) for _ in range(width - len(cells)))
+        return cells[:width]
 
     def special(self) -> Text | None:
         """The hall's text-only states (relocation transition, empty hall), else None."""
@@ -849,24 +1001,20 @@ class Hall(Widget):
         return None
 
     def build_cells(self) -> list[list[Cell]]:
-        """The picture, one (char, fg, bg) cell at a time: pixel hall, effects, scrollbar.
-        Rows are gw cells wide (gw + padding + scrollbar when the hall scrolls)."""
+        """The picture, one (char, fg, bg) cell at a time: pixel hall, tier headers, effects,
+        scrollbar. Rack rows are gw cells wide (gw + padding + scrollbar when it scrolls)."""
         game, p = self.game, self.game.pal
-        total, animating = sum(game.owned), game.animating
+        animating = game.animating
         w, t = self.size.width, game.now
         slow = math.floor(t * SLOW_HZ) / SLOW_HZ  # LEDs and glow tick slower than the pulse
-        cols, view_rows, total_rows, start = self.rack_layout()
-        first = start * cols
-        shown = min(total - first, view_rows * cols)
-        ends = list(accumulate(game.owned))  # racks are ordered by tier: find each one's tier
-        gw, gh = cols * CELL_W, view_rows * CELL_H
-        dead = game.read_only
+        lay = self.rack_layout()
+        gw, dead = lay.cols * CELL_W, game.read_only
         pulse = round(PULSE_STEPS * sine01(slow, TOP_PERIOD_S)) if animating else 0
-        key = (game.pal_serial, tuple(game.owned), game.top_tier(), first, shown, cols, view_rows, dead,
-               animating, pulse)
-        if self._base_key != key:  # sprites only change when the layout or the pulse step does
+        key = (game.pal_serial, tuple(game.owned), tuple(game.chips), game.top_tier(), lay.start,
+               lay.end, lay.cols, lay.height, dead, animating, pulse)
+        if self._base_key != key:  # sprites only change when the layout, a chip or the pulse step does
             self._base_key = key
-            self._base = self.base_grid(first, shown, cols, view_rows, ends, pulse)
+            self._base = self.base_grid(lay, pulse)
         base, leds = self._base
         grid = [row[:] for row in base]
         alert = game.crisis is not None and not dead
@@ -881,21 +1029,22 @@ class Hall(Widget):
                 grid[y][x] = led_on if self.led_lit(idx, pos // 8, pos % 8) else led_off
         if animating:
             if not game.crisis:  # data stops flowing while something is broken
-                self.draw_bus(grid, first, shown, cols, ends, t)
-            self.draw_sparks(grid, first, shown, cols, ends)
-        # scrollbar on the right edge when there are more racks than fit
-        lines = gh // 2
-        scrolled = total_rows > view_rows
-        thumb_len = thumb_pos = 0
-        if scrolled:
-            thumb_len = max(1, round(lines * view_rows / total_rows))
-            thumb_pos = round((lines - thumb_len) * start / max(1, total_rows - view_rows))
-        cells = [[("▀", grid[y][x], grid[y + 1][x]) for x in range(gw)] for y in range(0, gh, 2)]
-        if animating:
-            self.draw_floats(cells)
-        if scrolled:
+                self.draw_bus(grid, lay, t)
+            self.draw_sparks(grid, lay)
+        cells: list[list[Cell]] = [[("▀", grid[y][x], grid[y + 1][x]) for x in range(gw)]
+                                   for y in range(0, len(grid), 2)]
+        scrolled = lay.scrolled
+        for b in lay.blocks[lay.start:lay.end]:
+            if b.kind == "head":
+                line = b.line0 - lay.top_line
+                cells[line] = self.header_cells(b, w - 1 if scrolled else w, grid[line * 2][0])
+        if scrolled:  # scrollbar on the right edge when there is more hall than fits
+            lines = len(cells)
+            thumb_len = max(1, round(lines * lines / lay.total_lines))
+            thumb_pos = round((lines - thumb_len) * lay.top_line
+                              / max(1, lay.total_lines - lines))
             for line, row in enumerate(cells):
-                row.extend([(" ", None, None)] * max(0, w - gw - 1))
+                row.extend([(" ", None, None)] * max(0, w - 1 - len(row)))
                 thumb = thumb_pos <= line < thumb_pos + thumb_len
                 row.append((" ", None, p.muted if thumb else p.frame))
         return cells
@@ -1141,7 +1290,8 @@ class DataCenter(App):
     #side { width: 46; }
     .card {
         background: $surface; border: round $primary 50%;
-        border-title-color: $primary; border-title-style: bold; padding: 0 1;
+        border-title-color: $primary; border-title-style: bold; border-subtitle-color: $primary;
+        padding: 0 1;
     }
     #hall { height: 1fr; background: $background; padding: 0; }
     #log { height: 6; scrollbar-size-vertical: 1; }
@@ -1545,17 +1695,13 @@ class DataCenter(App):
             self.sync_clock()
 
     def anim_tick(self) -> None:
-        """Once a second: launch a new floating +$X while money lands, and make sure the
-        frame clock matches whether we are in front (this reads self.foreground, which
-        tick() cached: frames never ask tmux)."""
+        """Once a second: make sure the frame clock matches whether we are in front (this
+        reads self.foreground, which tick() cached: frames never ask tmux)."""
         if not self.animating:
             self.clear_fx()
             return
         self.now = clock()
         self.expire_fx()
-        floats = sum(fx.kind == "float" for fx in self.fx)
-        if self.income > 0 and floats < MAX_FLOATS:
-            self.add_fx("float", FLOAT_LIFE_S, text=f"+${fmt(self.income)}")
         self.sync_clock()
 
     def expire_fx(self) -> None:
@@ -1930,14 +2076,16 @@ class DataCenter(App):
         return max((i for i, n in enumerate(counts) if n > 0), default=0)
 
     def action_hall(self, how: str) -> None:
-        """Scroll the data hall (up/down one rack row, pageup/pagedown, home/end)."""
-        hall = self.query_one(Hall)
-        _, view_rows, total_rows, start = hall.rack_layout()
-        last = max(0, total_rows - view_rows)
-        target = {"up": start - 1, "down": start + 1, "pageup": start - view_rows,
-                  "pagedown": start + view_rows, "home": 0, "end": last}[how]
+        """Scroll the data hall: up/down one block (a tier header or a rack row), pageup/
+        pagedown a screenful, home/end to the ends (the bottom follows new racks)."""
+        lay = self.query_one(Hall).rack_layout()
+        last, blocks = lay.max_start, lay.blocks
+        back = next((i for i, b in enumerate(blocks) if b.line0 >= lay.top_line - lay.height), 0)
+        target = {"up": lay.start - 1, "down": lay.start + 1,
+                  "pageup": min(back, lay.start - 1), "pagedown": max(lay.end, lay.start + 1),
+                  "home": 0, "end": last}[how]
         target = max(0, min(last, target))
-        self.hall_scroll = None if target >= last else target  # the bottom follows new racks
+        self.hall_scroll = None if target >= last else target
         self.redraw()
 
     def action_pick(self, i: int) -> None:
@@ -2085,6 +2233,12 @@ class DataCenter(App):
             self._titles[wid] = title
             self.query_one(wid).border_title = title
 
+    def set_subtitle(self, wid: str, subtitle: str) -> None:
+        """Like set_title, for the text on a card's bottom border."""
+        if self._titles.get(wid + ":sub") != subtitle:
+            self._titles[wid + ":sub"] = subtitle
+            self.query_one(wid).border_subtitle = subtitle
+
     def draw_cash(self) -> None:
         """The balance; after a change it flashes and eases back to the normal colour."""
         p = self.pal
@@ -2117,7 +2271,7 @@ class DataCenter(App):
         anim = self.animating
         moving = anim and bool(sum(self.owned) or self.fx or self.reloc)
         sig = (self.cur, self.sites, tuple(self.owned), self.crisis is not None, self.pal_serial,
-               self.hall_scroll, self.query_one(Hall).size, int(self.now * ANIM_FPS) if moving else 0, anim,
+               tuple(self.chips), self.hall_scroll, self.query_one(Hall).size, int(self.now * ANIM_FPS) if moving else 0, anim,
                tuple((f.kind, f.seed) for f in self.fx), self.reloc is not None)
         if sig != self._hall_sig:  # a static hall costs nothing to leave alone
             self._hall_sig = sig
@@ -2186,22 +2340,54 @@ class DataCenter(App):
 
         self.draw_alert()
 
-        _, view_rows, total_rows, start = self.query_one(Hall).rack_layout()
-        title = f"#{self.cur + 1} {self.site_label(self.cur)} · {sum(self.owned):,} racks"
-        if self.read_only:
-            title += " · DECOMMISSIONED"
-        if total_rows > view_rows:
-            title += f" · rows {start + 1}-{start + view_rows}/{total_rows} ↑↓"
+        lay = self.query_one(Hall).rack_layout()
+        lead, racks = f"#{self.cur + 1} {self.site_label(self.cur)}", f" · {sum(self.owned):,} racks"
+        dead = " · DECOMMISSIONED" if self.read_only else ""
+        pos, short, cues = "", "", ""
+        if lay.scrolled and lay.start < lay.end:
+            shown = [b.row + 1 for b in lay.blocks[lay.start:lay.end] if b.kind == "rack"]
+            if shown:
+                pos = f" · rows {shown[0]}-{shown[-1]} of {lay.total_rows} ↑↓"
+                short = f" · {shown[0]}-{shown[-1]}/{lay.total_rows}"
+            cues = " · ".join(c for c, more in (("▲ more", lay.start > 0),
+                                                ("▼ more", lay.end < len(lay.blocks))) if more)
+        room = self.query_one(Hall).size.width - 4  # what fits in the border
+        title = lead + racks + dead + pos
+        if pos and len(title) > room:  # lose, in turn: the rack count, "rows ... ↑↓", the label, the name
+            for tail in (dead + pos, dead + short, short):
+                title = lead + tail
+                if len(title) <= room:
+                    break
+            else:
+                title = lead[:max(1, room - len(short) - 1)] + "…" + short
         self.set_title("#hall", title)
+        self.set_subtitle("#hall", f" {cues} " if cues else "")
         self.draw_hall()
         self.sync_clock()
 
     def row(self, text: Text, index: int, name: str, badge: str, accent: str,
-            name_style: str, badge_style: str) -> None:
+            name_style: str, badge_style: str, pips: Text | None = None) -> None:
         text.append(f" {index % 10} ", f"bold {rgb(self.pal.chip_text)} on {accent}")  # the 10th key is 0
+        extra = len(pips) + 1 if pips else 0  # the chip pips and a space, between name and badge
+        room = ROW_W - 5 - len(badge) - extra - 1
+        if len(name) > room:
+            name = name[:room - 1] + "…"
         text.append(f"  {name}", name_style)
-        text.append(" " * max(1, ROW_W - 5 - len(name) - len(badge)))
+        text.append(" " * max(1, ROW_W - 5 - len(name) - len(badge) - extra))
+        if pips:
+            text.append_text(pips)
+            text.append(" ")
         text.append(badge + "\n", badge_style)
+
+    def pips_text(self, tier: int, level: int) -> Text:
+        """The chip level as 5 mini bars, one per family, each filling in 4 steps (so it is
+        the same picture as the pips under every rack of the tier)."""
+        p = self.pal
+        colour = p.muted if self.read_only else p.tiers[tier]
+        out = Text()
+        for step in chip_pips(level):
+            out.append(PIP_GLYPHS[step], rgb(colour) if step else rgb(p.faint))
+        return out
 
     def servers_text(self) -> Text:
         p, shop = self.pal, Text()
@@ -2241,7 +2427,8 @@ class DataCenter(App):
             accent = rgb(p.tiers[i]) if ok else rgb(p.muted)
             self.row(shop, i + 1, name, "MAX" if maxed else f"L{level}", accent,
                      f"bold {accent}" if ok else rgb(p.muted),
-                     rgb(p.success) if maxed else rgb(p.fg) if level else rgb(p.faint))
+                     rgb(p.success) if maxed else rgb(p.fg) if level else rgb(p.faint),
+                     self.pips_text(i, level))
             shop.append("     ")
             if maxed:
                 shop.append(f"{tier} income x{CHIP_BOOST**MAX_CHIP:,}\n", rgb(p.success))

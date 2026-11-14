@@ -2,6 +2,7 @@
 and completely idle in a background pane / old data center / with DC_ANIM=0."""
 import asyncio
 import io
+import itertools
 import math
 import re
 
@@ -82,17 +83,6 @@ class Maths(AnimCase):
             self.assertEqual(game.anim_fps(raw), want, raw)
         self.assertEqual(game.FPS_DEFAULT, 12.0)
 
-    def test_float_rows_rate_and_ease_out(self) -> None:
-        self.assertEqual(game.float_rows(0), 0)
-        self.assertAlmostEqual(game.float_rows(game.FLOAT_LIFE_S), game.FLOAT_ROWS)
-        self.assertEqual(game.float_rows(99), game.FLOAT_ROWS)
-        self.assertAlmostEqual(game.FLOAT_LIFE_S / game.FLOAT_ROWS, game.FLOAT_ROW_S)  # 1 row per 0.28 s
-        self.assertTrue(0.25 <= game.FLOAT_ROW_S <= 0.3)
-        steps = [game.float_rows(i * game.FLOAT_LIFE_S / 20) for i in range(21)]
-        gaps = [b - a for a, b in zip(steps, steps[1:])]
-        self.assertTrue(all(g >= 0 for g in gaps))
-        self.assertTrue(all(a >= b for a, b in zip(gaps, gaps[1:])))  # decelerating
-
     def test_led_level_fades_instead_of_flipping(self) -> None:
         frame = 1 / 12
         biggest, seen = 0.0, set()
@@ -109,7 +99,6 @@ class Maths(AnimCase):
 class Frames(AnimCase):
     async def test_frames_are_deterministic_for_a_time(self) -> None:
         async with self.run_app(live_save()) as (app, _):
-            app.add_fx("float", game.FLOAT_LIFE_S, text="+$1.00K")
             app.sparkle(0, big=True)
             a, b = hall_frame(app, self.t + 0.3), hall_frame(app, self.t + 0.3)
             self.assertEqual(a, b)
@@ -118,11 +107,12 @@ class Frames(AnimCase):
     async def test_pulse_glides_monotonically_in_sub_cell_steps(self) -> None:
         async with self.run_app(live_save()) as (app, _):
             hall = app.query_one(game.Hall)
-            ends = list(game.accumulate(app.owned))
             heads = []
             for i in range(7):  # t = 0 .. 0.5 s at 12 fps
                 grid = [[app.pal.frame] * (game.CELL_W * 8) for _ in range(game.CELL_H)]
-                hall.draw_bus(grid, 0, 8, 8, ends, i / 12)
+                blocks = [game.Block("rack", 0, 0, 8, 0, game.RACK_LINES, 0)]
+                lay = game.Layout(8, 4, blocks, 0, 1, 4, 1, [0] + [-1] * (N - 1), [0] * N)
+                hall.draw_bus(grid, lay, i / 12)
                 lit = [(x, game.mix(app.pal.frame, c, 1)) for x, c in enumerate(grid[0])]
                 weights = [sum(abs(a - b) for a, b in zip(c, app.pal.frame)) for _, c in lit]
                 heads.append(sum(x * wt for (x, _), wt in zip(lit, weights)) / max(1, sum(weights)))
@@ -144,9 +134,8 @@ class Frames(AnimCase):
             for i in range(37):  # 3 s
                 hall_frame(app, i / 12)
                 hall = app.query_one(game.Hall)
-                c, *_ = hall.rack_layout()
-                j = sum(app.owned) - 1  # the lone Quantum Farm, last in the hall
-                cols.append(hall._base[0][(j // c) * game.CELL_H + 1 + 2][(j % c) * game.CELL_W])
+                x, y = hall.rack_layout().rack_xy(sum(app.owned) - 1, 4)  # the lone Quantum Farm
+                cols.append(hall._base[0][y + 2][x])
             for a, b in zip(cols, cols[1:]):
                 self.assertLessEqual(delta(a, b), 12)
             self.assertGreater(len(set(cols)), 3)
@@ -162,7 +151,6 @@ class Frames(AnimCase):
     async def test_every_theme_renders_every_effect(self) -> None:
         async with self.run_app(live_save()) as (app, pilot):
             app.crisis = {"title": "x", "sev": 1, "fixer": None, "eta": None}
-            app.add_fx("float", game.FLOAT_LIFE_S, text="+$9.99M")
             app.sparkle(2, big=True)
             for name in sorted(app.available_themes):
                 app.theme = name
@@ -175,7 +163,6 @@ class Frames(AnimCase):
     async def test_80x24_with_every_effect(self) -> None:
         async with self.run_app(live_save(), size=(80, 24)) as (app, _):
             app.crisis = {"title": "Rogue AI agent deleted prod", "sev": 3, "fixer": None, "eta": None}
-            app.add_fx("float", game.FLOAT_LIFE_S, text="+$123.45Qi")
             app.sparkle(1, big=True)
             hall = app.query_one(game.Hall)
             for i in range(8):
@@ -256,7 +243,7 @@ class Quiet(AnimCase):
             app.tick()  # back in front: animating again on the very next tick
             self.assertTrue(app.animating)
             self.assertIsNotNone(app._anim_timer)
-            self.assertEqual(len(app.fx), 1)
+            self.assertEqual(app.fx, [])  # nothing launches on its own any more
 
     async def test_one_timer_only(self) -> None:
         async with self.run_app(live_save()) as (app, _):
@@ -295,7 +282,6 @@ class Quiet(AnimCase):
     async def test_effects_are_dropped_when_you_walk_into_an_old_world(self) -> None:
         async with self.run_app(world_save()) as (app, pilot):
             app.sparkle(0)
-            app.add_fx("float", game.FLOAT_LIFE_S, text="+$1")
             self.assertTrue(app.fx)
             await pilot.press("left_square_bracket")
             self.assertTrue(app.read_only)
@@ -337,60 +323,6 @@ class Quiet(AnimCase):
 
 
 class Effects(AnimCase):
-    async def test_income_floats_are_throttled_and_expire(self) -> None:
-        async with self.run_app(live_save()) as (app, _):
-            for _ in range(10):
-                before = sum(f.kind == "float" for f in app.fx)
-                self.t += 1.0
-                app.tick()
-                after = sum(f.kind == "float" for f in app.fx)
-                self.assertLessEqual(after, game.MAX_FLOATS)
-                self.assertLessEqual(after - before, 1)  # one per second at most
-            self.assertIn(f"+${game.fmt(app.income)}", [f.text for f in app.fx])
-            app.owned[:] = [0] * N  # income stops: what is left must fade out
-            self.t += game.FLOAT_LIFE_S
-            app.tick()
-            self.assertEqual(app.fx, [])
-
-    async def test_floats_rise_at_the_specified_rate(self) -> None:
-        async with self.run_app(live_save()) as (app, _):
-            app.fx.clear()
-            app.add_fx("float", game.FLOAT_LIFE_S, text="+$5")
-            born = self.t
-            hall = app.query_one(game.Hall)
-            rows = []
-            for i in range(int(game.FLOAT_LIFE_S / 0.07)):
-                app.now = born + i * 0.07
-                lines = hall.render().plain.split("\n")
-                hit = [k for k, ln in enumerate(lines) if "+$5" in ln]
-                rows.append(hit[0] if hit else None)
-            seen = [r for r in rows if r is not None]
-            self.assertTrue(all(a >= b for a, b in zip(seen, seen[1:])))  # only ever goes up
-            self.assertEqual(seen[0] - seen[-1] >= game.FLOAT_ROWS - 2, True)
-            # average speed: the full climb takes FLOAT_ROWS * FLOAT_ROW_S seconds
-            self.assertAlmostEqual(game.float_rows(game.FLOAT_ROW_S * 7), 7.0)
-            first = {r: i for i, r in reversed(list(enumerate(rows))) if r is not None}
-            self.assertGreater(len(first), game.FLOAT_ROWS - 3)  # visits (nearly) every row
-            # patched clock: a frame at +life removes it
-            self.frame(app, game.FLOAT_LIFE_S + 0.01)
-            self.assertEqual([f for f in app.fx if f.text == "+$5"], [])
-
-    async def test_float_fades_towards_the_top(self) -> None:
-        async with self.run_app(live_save()) as (app, _):
-            app.fx.clear()
-            app.add_fx("float", game.FLOAT_LIFE_S, text="+$5")
-            cols = []
-            for i in range(11):
-                app.now = self.t + game.FLOAT_LIFE_S * i / 10
-                cells = [[(" ", app.pal.bg, app.pal.bg)] * 20 for _ in range(12)]
-                app.query_one(game.Hall).draw_floats(cells)
-                cols.append(next((c[1] for r in cells for c in r if c[0] == "+"), None))
-            cols = [c for c in cols if c]
-            self.assertGreater(len(set(cols)), 3)
-            self.assertGreater(game.lum(cols[0]) , -1)
-            for a, b in zip(cols, cols[1:]):
-                self.assertLessEqual(delta(a, b), 40)
-
     async def test_sparkle_on_buy_and_big_on_milestone(self) -> None:
         async with self.run_app(live_save(site_owned=[[24] + [0] * (N - 1)])) as (app, pilot):
             await pilot.press("1")  # 25th Budget VPS: x2
@@ -410,7 +342,8 @@ class Effects(AnimCase):
             for i in range(9):
                 app.now = fx.born + game.SPARK_LIFE_S * i / 8
                 grid = [[app.pal.bg] * 40 for _ in range(24)]
-                app.query_one(game.Hall).draw_sparks(grid, 0, 5, 5, list(game.accumulate(app.owned)))
+                hall = app.query_one(game.Hall)
+                hall.draw_sparks(grid, hall.rack_layout())
                 seen.append(sum(c != app.pal.bg for row in grid for c in row))
             self.assertGreater(max(seen), 0)
             self.assertEqual(seen[-1], 0)  # faded out completely
@@ -505,29 +438,8 @@ class Smooth(AnimCase):
 
     async def test_whole_hall_changes_a_little_each_frame(self) -> None:
         async with self.run_app(live_save()) as (app, _):
-            hall = app.query_one(game.Hall)
             frames = [hall_frame(app, self.t + i / 12) for i in range(6)]
             self.assertEqual(len({str(f.spans) for f in frames}), 6)  # all distinct
-
-
-class Contrast(AnimCase):
-    async def test_float_stays_readable_on_every_theme(self) -> None:
-        async with self.run_app(live_save()) as (app, pilot):
-            for name in sorted(app.available_themes):
-                app.theme = name
-                await pilot.pause()
-                app._pal = None
-                p = app.pal
-                app.fx.clear()
-                app.add_fx("float", game.FLOAT_LIFE_S, text="+$5")
-                for u in (0, 0.5, 0.9, 0.999):
-                    app.now = app.fx[0].born + u * game.FLOAT_LIFE_S
-                    cells = [[(" ", p.bg, m) for m in (p.bg, p.surface)] * 10 for _ in range(10)]
-                    app.query_one(game.Hall).draw_floats(cells)
-                    glyphs = [c for row in cells for c in row if c[0] == "+"]
-                    self.assertTrue(glyphs, (name, u))
-                    for _, fg, under in glyphs:
-                        self.assertGreaterEqual(game.contrast(fg, under), game.FLOAT_MIN_CONTRAST, name)
 
 
 class Relocation(AnimCase):
@@ -779,7 +691,6 @@ class Paint(AnimCase):
 
     async def test_frames_keep_the_cache_equal_to_a_full_render(self) -> None:
         async with self.run_app(live_save()) as (app, pilot):
-            app.add_fx("float", game.FLOAT_LIFE_S, text="+$1.00K")
             app.sparkle(1, big=True)
             for _ in range(10):
                 self.frame(app, 1 / 12)
@@ -795,7 +706,7 @@ class Paint(AnimCase):
                 await pilot.pause(0.2)
                 p = app.pal
                 cached = screen_cells(app)
-                self.assertIn(p.shadow, {c[2] for row in cached for c in row}, name)  # new colours
+                self.assertIn(p.pip_floor, {c[2] for row in cached for c in row}, name)  # new colours
                 await self.check(app, pilot, name)
 
     async def test_only_changed_rows_are_repainted(self) -> None:
@@ -1003,7 +914,7 @@ class PaintStock(AnimCase):
         big = [200, 100, 50, 30, 20] + [0] * (N - 5)
         async with self.run_app(live_save(site_owned=[big], site_balance=[10**12])) as (app, pilot):
             await self.check(app, pilot, f"{mode} idle")
-            app.add_fx("float", game.FLOAT_LIFE_S, text="+$1.00K")
+            app.sparkle(1, big=True)
             for _ in range(5):
                 self.frame(app, 1 / 12)
                 await self.check(app, pilot, f"{mode} frame")
@@ -1034,3 +945,495 @@ class PaintStock(AnimCase):
         game.CroppedChops.cropped = boom  # type: ignore[method-assign]
         self.addCleanup(lambda: setattr(game.CroppedChops, "cropped", orig))
         await self.flows("raising crop")
+
+
+# ------------------------------------------------- chip pips, tier headers, hall navigation
+
+TALL = (120, 60)
+CHIPS = [0, 5, 20, 1, 4] + [0] * (N - 5)  # tier 0 none, 1 = L5, 2 = full, 3 = L1, 4 = L4
+
+
+def chip_save(**extra: object) -> dict[str, object]:
+    return live_save(site_chips=[list(CHIPS)], **extra)
+
+
+def line_text(cells: list[game.Cell]) -> str:
+    return "".join(c[0] for c in cells)
+
+
+def header_lines(app: object) -> dict[int, list[game.Cell]]:
+    """Visible hall line -> its cells, for every tier header line on screen."""
+    hall = app.query_one(game.Hall)  # type: ignore[attr-defined]
+    lay = hall.rack_layout()
+    cells = hall.build_cells()
+    return {b.line0 - lay.top_line: cells[b.line0 - lay.top_line]
+            for b in lay.blocks[lay.start:lay.end] if b.kind == "head"}
+
+
+def pip_pixels(app: object, idx: int, tier: int) -> list[game.RGB]:
+    """The five chip pip pixels under rack `idx`, from the cached base picture."""
+    hall = app.query_one(game.Hall)  # type: ignore[attr-defined]
+    hall.render()
+    x, y = hall.rack_layout().rack_xy(idx, tier)
+    return [hall._base[0][y + 6][x + 1 + i] for i in range(5)]
+
+
+class NoFloats(AnimCase):
+    async def test_money_floats_are_gone_but_flash_and_sparks_stay(self) -> None:
+        self.assertFalse(any("float" in n.lower() for n in dir(game) if n != "float"))
+        self.assertFalse(hasattr(game.Hall, "draw_floats"))
+        async with self.run_app(live_save(site_balance=[10**9])) as (app, pilot):
+            for _ in range(4):
+                self.t += 1.0
+                app.tick()
+            self.assertEqual(app.fx, [])  # earning money launches nothing
+            await pilot.press("1")
+            self.assertEqual([f.kind for f in app.fx], ["spark"])
+            self.assertNotEqual(app.cash_flash, 0)
+            for i in range(6):
+                self.assertNotIn("+$", hall_frame(app, self.t + i * 0.2).plain)
+
+
+class ChipPips(AnimCase):
+    def test_levels_are_five_families_of_four_editions(self) -> None:
+        self.assertEqual(game.MAX_CHIP, game.CHIP_PIPS * game.CHIP_STEPS)
+        want = {0: [0, 0, 0, 0, 0], 1: [1, 0, 0, 0, 0], 4: [4, 0, 0, 0, 0],
+                5: [4, 1, 0, 0, 0], 20: [4, 4, 4, 4, 4]}
+        for level, pips in want.items():
+            self.assertEqual(game.chip_pips(level), pips, level)
+        for level in range(21):
+            self.assertEqual(sum(game.chip_pips(level)), level)  # nothing lost, nothing extra
+
+    async def test_rack_pips_per_level_and_consistent_across_racks(self) -> None:
+        async with self.run_app(chip_save(), size=TALL) as (app, _):
+            p = app.pal
+            ends = list(itertools.accumulate(app.owned))
+            for tier in range(5):
+                hue, level = p.tiers[tier], CHIPS[tier]
+                racks = range(ends[tier] - app.owned[tier], ends[tier])
+                seen = {tuple(pip_pixels(app, i, tier)) for i in racks}
+                self.assertEqual(len(seen), 1, tier)  # every rack of a tier shows the same level
+                pixels = list(seen.pop())
+                for step, px in zip(game.chip_pips(level), pixels):
+                    if step == 0:
+                        self.assertEqual(px, p.pip_floor, (tier, level))
+                    else:
+                        self.assertNotEqual(px, p.pip_floor, (tier, level))
+                        self.assertNotEqual(px, hue, (tier, level))  # never the sprite's own colour
+                lit = [game.contrast(px, p.pip_floor) for px in pixels]
+                self.assertEqual(lit, sorted(lit, reverse=True))  # fills from the left
+            self.assertEqual(set(pip_pixels(app, 0, 0)), {p.pip_floor})  # level 0: nothing installed
+            full = set(pip_pixels(app, ends[2] - 1, 2))
+            self.assertEqual(len(full), 1)  # level 20: all five pips the same, full
+            self.assertGreater(game.lum(full.pop()), game.lum(p.tiers[2]))
+
+    async def test_each_edition_is_a_distinct_brightness(self) -> None:
+        async with self.run_app(live_save(), size=TALL) as (app, _):
+            hall, p = app.query_one(game.Hall), app.pal
+            seen = []
+            for level in range(5):  # one family: 0, 1, 2, 3, 4 editions
+                app.chips[1] = level
+                hall.render()
+                hall._base_key = None
+                seen.append(pip_pixels(app, app.owned[0], 1)[0])
+            self.assertEqual(len(set(seen)), 5)
+            self.assertEqual(seen[0], p.pip_floor)
+            lums = [game.lum(c) for c in seen]
+            self.assertEqual(lums, sorted(lums))  # every edition is brighter than the last
+
+    def test_pips_sit_on_a_row_no_sprite_or_led_uses(self) -> None:
+        for sprite in game.SPRITES:
+            self.assertEqual(len(sprite), 6)  # rows 0..5; the pips take row 6 (the old shadow)
+            self.assertTrue(all(len(row) == 6 for row in sprite))
+
+    async def test_pips_cost_nothing_per_frame(self) -> None:
+        async with self.run_app(chip_save(), size=TALL) as (app, _):
+            calls: list[int] = []
+            orig = game.Hall.base_grid
+            game.Hall.base_grid = lambda self, *a, **k: (calls.append(1), orig(self, *a, **k))[1]  # type: ignore
+            self.addCleanup(lambda: setattr(game.Hall, "base_grid", orig))
+            hall_frame(app, self.t)
+            n = len(calls)
+            for i in range(1, 6):  # same glow step: the base picture is reused
+                hall_frame(app, self.t + i * 0.01)
+            self.assertEqual(len(calls), n)
+            before = header_lines(app)
+            hall_frame(app, self.t + 0.5)
+            self.assertEqual(header_lines(app), before)  # headers are identical every frame
+
+    async def test_read_only_pips_are_washed_out(self) -> None:
+        async with self.run_app(world_save(site_chips=[[20] * N] * 3), size=TALL) as (app, pilot):
+            live = pip_pixels(app, 0, 0)
+            await pilot.press("left_square_bracket")
+            self.assertTrue(app.read_only)
+            dead = pip_pixels(app, 0, 0)
+            self.assertEqual(len(set(dead)), 1)  # level 20: all five pips full
+            spread = lambda c: max(c) - min(c)  # noqa: E731
+            self.assertLess(spread(dead[0]), spread(live[0]))  # grey, not the tier colour
+            self.assertNotEqual(dead[0], app.pal.shadow)
+            self.assertIsNone(app._anim_timer)
+            self.assertEqual(hall_frame(app, 1.0), hall_frame(app, 7.3))  # still
+
+    async def test_card_shows_the_same_mini_indicator(self) -> None:
+        async with self.run_app(chip_save(), size=TALL) as (app, pilot):
+            await pilot.press("c")
+            app.shop_top = 0
+            app.redraw()
+            lines = app._last["#shop"].plain.split("\n")
+            for tier, pips in enumerate(["·····", "█▂···", "█████", "▂····", "█····"]):
+                if 2 * tier + 1 < len(lines):  # a short card shows fewer tiers
+                    self.assertIn(pips, lines[2 * tier], tier)
+            for ln in lines:
+                self.assertLessEqual(len(ln), game.ROW_W)
+
+
+class Headers(AnimCase):
+    def test_header_label_fits_and_degrades_in_order(self) -> None:
+        self.assertEqual(game.header_label("COMPUTE NODE", 9, 3, 60), "COMPUTE NODE x9 · chip L3/20")
+        self.assertEqual(game.header_label("COMPUTE NODE", 9, 3, 25), "COMPUTE NODE x9 · L3/20")
+        self.assertEqual(game.header_label("COMPUTE NODE", 9, 3, 21), "COMPUTE NODE x9 L3/20")
+        self.assertEqual(game.header_label("NEUTRON STAR FARM", 4000, 20, 27), "NEUTRON STAR… x4000 L20/20")
+        for room in range(0, 70):
+            for name in ("BUDGET VPS", "NEUTRON STAR FARM"):
+                self.assertLessEqual(len(game.header_label(name, 4000, 20, room)), max(0, room))
+        self.assertIn("L20/20", game.header_label("NEUTRON STAR FARM", 4000, 20, 27))  # the level stays
+
+    async def test_every_owned_tier_has_a_header_with_its_key_and_level(self) -> None:
+        async with self.run_app(chip_save(), size=TALL) as (app, _):
+            heads = header_lines(app)
+            self.assertEqual(len(heads), 5)  # only tiers you own
+            for (line, cells), tier in zip(sorted(heads.items()), range(5)):
+                text = line_text(cells)
+                name = game.TIERS[tier][0].upper()
+                self.assertIn(f" {tier + 1} ", text[:3])  # the number key that buys it
+                self.assertIn(f"{name} x{app.owned[tier]}", text)
+                self.assertIn(f"L{CHIPS[tier]}/20", text)
+                self.assertEqual(cells[0][2], app.pal.tiers[tier])  # badge in the tier colour
+                self.assertEqual(sum(c[1] == app.pal.frame for c in cells) > 0, True)  # rule
+
+    async def test_the_tenth_tier_is_key_zero(self) -> None:
+        async with self.run_app(live_save(site_owned=[[1] * N], site_chips=[[0] * N]),
+                                size=(120, 90)) as (app, _):
+            last = line_text(header_lines(app)[max(header_lines(app))])
+            self.assertTrue(last.startswith(" 0  BLACK HOLE COLO"), last)
+
+    async def test_headers_scroll_with_the_content(self) -> None:
+        big = [30, 20, 12, 9, 5, 3, 1, 0, 0, 0]
+        async with self.run_app(live_save(site_owned=[big], site_chips=[[0] * N])) as (app, pilot):
+            hall = app.query_one(game.Hall)
+            await pilot.press("home")
+            lay = hall.rack_layout()
+            self.assertEqual(lay.blocks[0].kind, "head")
+            self.assertIn("BUDGET VPS", line_text(header_lines(app)[0]))
+            first = lay.blocks[lay.start + 1]  # one block down: the header is gone, racks moved up
+            await pilot.press("down")
+            self.assertEqual(hall.rack_layout().start, 1)
+            self.assertNotIn(0, header_lines(app))
+            seen = set()
+            for _ in range(len(lay.blocks)):  # walk to the end: every tier's header shows up
+                seen.update(line_text(c).split()[1] for c in header_lines(app).values())
+                await pilot.press("down")
+            self.assertTrue({"COMPUTE", "GPU", "AI", "QUANTUM", "ORBITAL", "FUSION"} <= seen, seen)
+            del first
+
+    async def test_header_follows_its_racks_by_exactly_the_block_height(self) -> None:
+        big = [30, 20, 12, 9, 5, 3, 1, 0, 0, 0]
+        async with self.run_app(live_save(site_owned=[big], site_chips=[[0] * N])) as (app, pilot):
+            hall = app.query_one(game.Hall)
+            await pilot.press("home")
+            for _ in range(6):
+                lay = hall.rack_layout()
+                before = {b.tier: b.line0 - lay.top_line for b in lay.blocks[lay.start:lay.end]
+                          if b.kind == "head"}
+                await pilot.press("down")
+                lay2 = hall.rack_layout()
+                step = lay.blocks[lay.start].height  # lines the content moved up
+                after = {b.tier: b.line0 - lay2.top_line for b in lay2.blocks[lay2.start:lay2.end]
+                         if b.kind == "head"}
+                for tier, line in after.items():
+                    if tier in before:
+                        self.assertEqual(line, before[tier] - step)
+
+    async def test_follow_newest_with_headers_and_a_new_tier(self) -> None:
+        big = [30, 20, 12, 9, 5, 3, 1, 0, 0, 0]
+        async with self.run_app(live_save(site_owned=[big], site_balance=[10**15])) as (app, pilot):
+            hall = app.query_one(game.Hall)
+            self.assertIsNone(app.hall_scroll)
+            self.assertEqual(hall.rack_layout().end, len(hall.rack_layout().blocks))  # bottom in view
+            await pilot.press("8")  # first Dyson Swarm: a new header + row appear at the bottom
+            lay = hall.rack_layout()
+            self.assertEqual(lay.blocks[-1].tier, 7)
+            self.assertEqual(lay.end, len(lay.blocks))
+            self.assertIn("DYSON SWARM x1", " ".join(line_text(c) for c in header_lines(app).values()))
+            await pilot.press("home")  # scrolled away: buying does not drag the view
+            await pilot.press("8")
+            self.assertEqual(hall.rack_layout().start, 0)
+
+    async def test_position_and_more_cues(self) -> None:
+        big = [30, 20, 12, 9, 5, 3, 1, 0, 0, 0]
+        async with self.run_app(live_save(site_owned=[big])) as (app, pilot):
+            hall = app.query_one(game.Hall)
+            total = hall.rack_layout().total_rows
+            self.assertEqual(app._titles["#hall:sub"].strip(), "▲ more")  # following: bottom
+            self.assertIn(f"of {total}", app._titles["#hall"])
+            await pilot.press("home")
+            self.assertEqual(app._titles["#hall:sub"].strip(), "▼ more")
+            self.assertIn("rows 1-", app._titles["#hall"])
+            await pilot.press("down")
+            self.assertEqual(app._titles["#hall:sub"].strip(), "▲ more · ▼ more")
+            lay = hall.rack_layout()
+            shown = [b.row for b in lay.blocks[lay.start:lay.end] if b.kind == "rack"]
+            self.assertIn(f"rows {shown[0] + 1}-{shown[-1] + 1} of {total}", app._titles["#hall"])
+            await pilot.press("end")
+            self.assertEqual(app._titles["#hall:sub"].strip(), "▲ more")
+
+    async def test_no_cue_when_everything_fits(self) -> None:
+        async with self.run_app(live_save(site_owned=[[2] + [0] * (N - 1)]), size=TALL) as (app, _):
+            self.assertEqual(app._titles["#hall:sub"], "")
+            self.assertNotIn("rows", app._titles["#hall"])
+            self.assertFalse(app.query_one(game.Hall).rack_layout().scrolled)
+
+    async def test_title_keeps_the_position_on_a_narrow_hall(self) -> None:
+        big = [30, 20, 12, 9, 5, 3, 1, 0, 0, 0]
+        async with self.run_app(live_save(site_owned=[big]), size=(80, 24)) as (app, pilot):
+            await pilot.press("home")
+            title = app._titles["#hall"]
+            self.assertRegex(title, r"1-\d+/\d+$")  # "rows" and the arrows give way to the numbers
+            self.assertLessEqual(len(title), app.query_one(game.Hall).size.width - 4)
+
+    async def test_decommissioned_title_keeps_its_label_and_position(self) -> None:
+        async with self.run_app(world_save(), size=(150, 24)) as (app, pilot):
+            await pilot.press("left_square_bracket")
+            title = app._titles["#hall"]
+            self.assertIn("DECOMMISSIONED", title)
+            self.assertIn("rows ", title)
+            self.assertLessEqual(len(title), app.query_one(game.Hall).size.width - 4)
+        async with self.run_app(world_save(), size=(80, 24)) as (app, pilot):  # too narrow for the label
+            await pilot.press("left_square_bracket")
+            self.assertRegex(app._titles["#hall"], r"\d+-\d+/\d+$")  # the position survives
+            self.assertLessEqual(len(app._titles["#hall"]), app.query_one(game.Hall).size.width - 4)
+
+    async def test_read_only_headers_are_washed_out_and_still(self) -> None:
+        async with self.run_app(world_save(), size=TALL) as (app, pilot):
+            live = list(header_lines(app).values())[0]
+            await pilot.press("left_square_bracket")
+            self.assertTrue(app.read_only)
+            dead = list(header_lines(app).values())[0]
+            spread = lambda c: max(c) - min(c)  # noqa: E731
+            self.assertLess(spread(dead[0][2]), spread(live[0][2]))  # grey badge, not the tier colour
+            self.assertEqual(hall_frame(app, 1.0), hall_frame(app, 9.9))  # nothing moves
+            self.assertIsNone(app._anim_timer)
+
+    async def test_widths_at_80x24_and_everything_you_could_own(self) -> None:
+        fleets = [[4000] * N, [1] * N, [25, 9, 1] + [0] * (N - 3), [4000] + [0] * (N - 1)]
+        for fleet in fleets:
+            for chips in ([0] * N, [20] * N, [7] * N):
+                async with self.run_app(live_save(site_owned=[fleet], site_chips=[chips],
+                                                  site_balance=[10**15]), size=(80, 24)) as (app, pilot):
+                    hall = app.query_one(game.Hall)
+                    for key in ("home", "pagedown", "down", "end", "pageup"):
+                        await pilot.press(key)
+                        for row in hall.build_cells():
+                            self.assertLessEqual(len(row), hall.size.width, (fleet[:2], key))
+                        for ln in hall.render().plain.split("\n"):
+                            self.assertLessEqual(len(ln), hall.size.width)
+                        for cells in header_lines(app).values():
+                            self.assertIn("L", line_text(cells))
+                            self.assertGreaterEqual(len(cells), hall.size.width - 1)
+                    await pilot.press("c")
+                    for top in (0, 5):
+                        app.shop_top = top
+                        app.redraw()
+                        for ln in app._last["#shop"].plain.split("\n"):
+                            self.assertLessEqual(len(ln), game.ROW_W)
+
+    async def test_headers_and_pips_are_readable_on_every_theme(self) -> None:
+        async with self.run_app(chip_save(), size=TALL) as (app, pilot):
+            for name in sorted(app.available_themes):
+                app.theme = name
+                await pilot.pause()
+                app._pal = None
+                for cells in header_lines(app).values():
+                    for ch, fg, bg in cells:
+                        if ch not in " ─":
+                            self.assertGreaterEqual(game.contrast(fg, bg), 2.99, (name, ch))
+                    self.assertGreaterEqual(game.contrast(cells[1][1], cells[1][2]), 2.99, name)  # key badge
+                p = app.pal
+                self.assertNotEqual(pip_pixels(app, 8, 1)[0], pip_pixels(app, 8, 1)[4], name)  # L5 shows
+                self.assertNotEqual(pip_pixels(app, 8, 1)[0], p.pip_floor, name)
+
+
+class HeaderPaint(AnimCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.term = install_term(self)
+        orig = game.DataCenter.tick
+        game.DataCenter.tick = lambda self: None  # type: ignore[method-assign]
+        self.addCleanup(lambda: setattr(game.DataCenter, "tick", orig))
+        self.check = Paint.check.__get__(self)
+
+    def headers_match(self, app: object, label: str) -> None:
+        """Header text and rule cells, which Paint.check skips (it compares only the pixels)."""
+        cached, want = screen_cells(app), expected_cells(app)
+        n = 0
+        for line in header_lines(app):
+            norm = lambda cells: [(ch, None if ch == " " else fg, bg) for ch, fg, bg in cells]  # noqa: E731
+            self.assertEqual(norm(cached[line][:len(want[line])]), norm(want[line]), (label, line))
+            n += 1
+        self.assertGreater(n + (1 if not header_lines(app) else 0), 0)
+
+    async def test_cache_term_and_full_render_agree_with_headers_and_chips(self) -> None:
+        big = [200, 100, 50, 30, 20] + [0] * (N - 5)
+        save = live_save(site_owned=[big], site_balance=[10**15], site_chips=[[0, 5, 20, 1, 4] + [0] * (N - 5)])
+        async with self.run_app(save) as (app, pilot):
+            await self.check(app, pilot, "idle")
+            self.headers_match(app, "idle")
+            for key in ("home", "down", "down", "pagedown", "pageup", "end", "up"):
+                await pilot.press(key)
+                await self.check(app, pilot, key)
+                self.headers_match(app, key)
+            await pilot.press("c")
+            await pilot.press("2")  # buy a chip: the header text and the pips change, nothing stale
+            await self.check(app, pilot, "chip bought")
+            self.headers_match(app, "chip bought")
+            await pilot.press("home")
+            await self.check(app, pilot, "home after the chip")
+            hall = app.query_one(game.Hall)
+            lay = hall.rack_layout()
+            head = hall.header_cells(lay.blocks[lay.tier_block[1]], 60, app.pal.bg)
+            self.assertIn("COMPUTE NODE x100 · chip L6/20", line_text(head))
+            self.assertIn("L6", app._last["#shop"].plain)  # the chips card agrees with the header
+            for size in ((80, 24), (150, 50)):
+                await pilot.resize_terminal(*size)
+                await pilot.pause(0.2)
+                await self.check(app, pilot, f"resize {size}")
+                self.headers_match(app, f"resize {size}")
+            for _ in range(4):
+                self.frame(app, 1 / 12)
+                await self.check(app, pilot, "frame")
+
+    async def test_old_world_with_headers(self) -> None:
+        async with self.run_app(world_save()) as (app, pilot):
+            await pilot.press("left_square_bracket")
+            await self.check(app, pilot, "old world")
+            self.headers_match(app, "old world")
+
+
+def lab(c: game.RGB) -> tuple[float, float, float]:
+    """CIE Lab of an sRGB colour, for measuring how different two colours look."""
+    def f(v: int) -> float:
+        x = v / 255
+        return x / 12.92 if x <= 0.04045 else ((x + 0.055) / 1.055) ** 2.4
+    r, g, b = f(c[0]), f(c[1]), f(c[2])
+    x, y, z = (0.4124 * r + 0.3576 * g + 0.1805 * b) / 0.95047, 0.2126 * r + 0.7152 * g + 0.0722 * b, \
+        (0.0193 * r + 0.1192 * g + 0.9505 * b) / 1.08883
+    h = lambda t: t ** (1 / 3) if t > 0.008856 else 7.787 * t + 16 / 116  # noqa: E731
+    return 116 * h(y) - 16, 500 * (h(x) - h(y)), 200 * (h(y) - h(z))
+
+
+class PipVisibility(AnimCase):
+    async def test_every_level_is_clear_on_every_theme_and_tier(self) -> None:
+        async with self.run_app(live_save()) as (app, _):
+            worst_contrast, worst_step = 99.0, 999.0
+            for name, theme in sorted(app.available_themes.items()):
+                p = game.Palette(theme.to_color_system().generate(), theme.dark)
+                for tier in range(N):
+                    grey = int(game.lum(p.tiers[tier]) * 255)  # a decommissioned world's colour
+                    for hue in (p.tiers[tier], game.mix((grey, grey, grey), p.surface, 0.55)):
+                        cols = [game.pip_colour(s, hue, p.pip_floor) for s in range(game.CHIP_STEPS + 1)]
+                        self.assertEqual(cols[0], p.pip_floor)
+                        for c in cols[1:]:
+                            worst_contrast = min(worst_contrast, game.contrast(c, p.pip_floor))
+                        for a, b in zip(cols, cols[1:]):  # empty -> 1 -> 2 -> 3 -> 4
+                            worst_step = min(worst_step, math.dist(lab(a), lab(b)))
+            self.assertGreaterEqual(worst_contrast, 2.99)  # lit against empty
+            self.assertGreaterEqual(worst_step, 8.0)  # adjacent levels clearly different (CIE76 dE)
+
+    async def test_the_hall_really_draws_those_colours_on_a_light_and_a_dark_theme(self) -> None:
+        async with self.run_app(chip_save(), size=TALL) as (app, pilot):
+            for name in ("gruvbox", "atom-one-light"):
+                app.theme = name
+                await pilot.pause()
+                app._pal = None
+                p = app.pal
+                px = pip_pixels(app, 8, 1)  # tier 1 at L5: [full, 1 step, empty, empty, empty]
+                self.assertGreaterEqual(game.contrast(px[0], p.pip_floor), 2.99, name)
+                self.assertGreaterEqual(game.contrast(px[1], p.pip_floor), 2.99, name)
+                self.assertEqual(px[2:], [p.pip_floor] * 3, name)
+                self.assertGreater(math.dist(lab(px[0]), lab(px[1])), 8, name)
+
+
+class NoOrphanHeaders(AnimCase):
+    @staticmethod
+    def layout(owned: list[int], w: int, h: int, scroll: int | None) -> game.Layout:
+        from textual.geometry import Size
+
+        class Fake:
+            pass
+        fake = Fake()
+        fake.owned, fake.hall_scroll = list(owned), scroll  # type: ignore[attr-defined]
+
+        class H(game.Hall):
+            game = property(lambda self: fake)  # type: ignore[assignment]
+            size = property(lambda self: Size(w, h))  # type: ignore[assignment]
+        hall = H.__new__(H)
+        hall._blocks_owned, hall._blocks = (), {}
+        return hall.rack_layout()
+
+    def check(self, owned: list[int], w: int, h: int) -> None:
+        n = len(self.layout(owned, w, h, None).blocks)
+        seen: set[int] = set()
+        for scroll in [None, *range(n + 2)]:
+            lay = self.layout(owned, w, h, scroll)
+            vis = lay.blocks[lay.start:lay.end]
+            label = (owned, w, h, scroll)
+            self.assertTrue(vis, label)
+            self.assertNotEqual(vis[-1].kind, "head", label)  # never a header without its racks
+            self.assertLessEqual(lay.used, lay.height, label)
+            seen.update(range(lay.start, lay.end))
+            if lay.end < n:  # the window is as full as it can be without a trailing header
+                nxt = lay.blocks[lay.end]
+                fits = lay.used + nxt.height <= lay.height
+                self.assertTrue(not fits or nxt.kind == "head", label)
+        follow = self.layout(owned, w, h, None)
+        self.assertEqual(follow.end, n, (owned, w, h))  # following shows the very last rack
+        racks = [b for b in follow.blocks if b.kind == "rack"]
+        self.assertIsNotNone(follow.rack_xy(racks[-1].first + racks[-1].count - 1, racks[-1].tier))
+        self.assertEqual(len(seen), n, (owned, w, h))  # every block (so every rack) is reachable
+
+    def test_no_orphan_header_for_many_sizes_fleets_and_positions(self) -> None:
+        fleets = [[30, 20, 12, 9, 5, 3, 1, 0, 0, 0], [1] * 10, [60] + [0] * 9, [0, 0, 7, 0, 1, 0, 0, 0, 0, 2],
+                  [25, 9, 1] + [0] * 7, [3] * 10, [12, 1, 12, 1, 12, 1, 12, 1, 12, 1]]
+        for owned in fleets:
+            for w in (14, 31, 62, 150):
+                for h in (5, 6, 9, 14, 15, 24, 33):
+                    self.check(owned, w, h)
+
+    def test_the_reported_case(self) -> None:
+        owned = [30, 20, 12, 9, 5, 3, 1, 0, 0, 0]
+        lay = self.layout(owned, 32, 15, 6)  # 80x24 hall, a few steps down from the top
+        self.assertNotEqual(lay.blocks[lay.end - 1].kind, "head")
+
+    async def test_keys_reach_every_rack_and_never_end_on_a_header(self) -> None:
+        owned = [30, 20, 12, 9, 5, 3, 1, 0, 0, 0]
+        async with self.run_app(live_save(site_owned=[owned]), size=(80, 24)) as (app, pilot):
+            hall = app.query_one(game.Hall)
+            await pilot.press("home")
+            seen: set[int] = set()
+            for _ in range(60):
+                lay = hall.rack_layout()
+                self.assertNotEqual(lay.blocks[lay.end - 1].kind, "head")
+                seen.update(range(lay.start, lay.end))
+                await pilot.press("down")
+            self.assertEqual(len(seen), len(hall.rack_layout().blocks))
+            await pilot.press("home")
+            seen.clear()
+            for _ in range(60):
+                lay = hall.rack_layout()
+                seen.update(range(lay.start, lay.end))
+                await pilot.press("pagedown")
+            self.assertIn(len(lay.blocks) - 1, seen)  # pagedown gets to the last rack row
+            await pilot.press("home")
+            await pilot.press("end")
+            self.assertIsNone(app.hall_scroll)
+            self.assertEqual(hall.rack_layout().end, len(hall.rack_layout().blocks))

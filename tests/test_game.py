@@ -28,7 +28,8 @@ class Basics(AppCase):
             self.assertEqual(app.chips[9], 1)
             await pilot.press("h", "0")
             self.assertEqual(app.staff[9], 0)
-            self.assertIn("runs Black Hole Colo", str(app.query_one(game.RichLog).lines[-1].text))
+            log = [str(line.text) for line in app.query_one(game.RichLog).lines]
+            self.assertTrue(any("runs Black Hole Colo" in line for line in log), log)  # a crisis may log after
 
     async def test_save_round_trip_and_old_six_tier_saves(self) -> None:
         async with self.run_app(world_save()) as (app, pilot):
@@ -171,13 +172,17 @@ class Interface(AppCase):
             app.owned[:] = [300] * 10
             app.redraw()
             hall = app.query_one(game.Hall)
-            _, view_rows, total_rows, start = hall.rack_layout()
-            self.assertGreater(total_rows, view_rows)
-            self.assertEqual(start, total_rows - view_rows)  # following the newest racks
+            lay = hall.rack_layout()
+            self.assertTrue(lay.scrolled)
+            self.assertEqual(lay.start, lay.max_start)  # following the newest racks
+            self.assertEqual(lay.end, len(lay.blocks))
             await pilot.press("home")
-            self.assertEqual(hall.rack_layout()[3], 0)
+            lay = hall.rack_layout()
+            self.assertEqual((lay.start, app.hall_scroll), (0, 0))
             await pilot.press("pagedown")
-            self.assertEqual(hall.rack_layout()[3], view_rows)
+            self.assertEqual(hall.rack_layout().start, lay.end)  # the first block not yet shown
+            await pilot.press("down")
+            self.assertEqual(hall.rack_layout().start, lay.end + 1)
             await pilot.press("end")
             self.assertIsNone(app.hall_scroll)
 

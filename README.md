@@ -36,7 +36,7 @@ data-center-tui --save my.json       # use a different save file
 | `1`-`9`, `0` | Pick an item in the open card (`0` is the 10th): buy a server, install a chip, or hire/train crew |
 | `s` `c` `h` `d` `b` | Open the **s**ervers, **c**hips, crew (**h**ire), **d**ata centers or leaderboard (**b**oard) card |
 | `,` / `.` | Scroll the open card when it has more rows than fit |
-| `↑` `↓` `PgUp` `PgDn` `Home` `End` | Scroll the data hall |
+| `↑` `↓` `PgUp` `PgDn` `Home` `End` | Scroll the data hall (a tier header or a rack row at a time) |
 | `x` | **Relocate** to the next data center (when your newest one reaches its target) |
 | `[` / `]` | Visit the older / newer data center (or press `d`, then `1`-`6`) |
 | `f` | Fix the current crisis yourself |
@@ -57,7 +57,8 @@ data-center-tui --save my.json       # use a different save file
 - **Relocate, forever.** Reach $10 quadrillion in your newest data center and you can relocate to the next one (Garage in Palo Alto, Abandoned Mall in Ohio, Decommissioned Missile Silo, ... and on into Parallel Universes). You **start from scratch** there: money, servers, chips and crew all reset. The old data center is **decommissioned**: you can visit it (`d`, or `[` and `]`) and look around, with the lights off and everything washed out, but you can't buy anything there and it earns nothing. Your newest data center keeps earning while you look. Each new data center has bigger numbers and a target 1000x higher, and takes a little longer than the last. There is no last level.
 - **Fame and status.** Every relocation earns **Fame** (more if you waited past the target): each point is +2% income in every data center, forever. Fame also climbs your status ladder: Nobody, Intern, Junior Dev, Senior Dev, Tech Lead, Engineering Manager, Director, VP of Engineering, CTO, Tech CEO, Tech Billionaire, Tech Overlord, and then Tech Overlord II, III, ... without end.
 - **Names.** Every data center can be given your own name (`n`, or the menu), up to 24 plain characters; leave it blank for the default.
-- **Scrollable data hall.** All your racks are drawn, cheapest tier first, with a scrollbar; it follows the newest racks until you scroll.
+- **Scrollable data hall.** All your racks are drawn, cheapest tier first, each tier under a header line (`2 COMPUTE NODE x9 · chip L3/20`, with the key that buys it), and a scrollbar; the hall title shows which rack rows you are looking at, with `▲ more` / `▼ more` when there is more off screen. It follows the newest racks until you scroll.
+- **Chip level at a glance.** Under every rack, five small pips (single pixels on the rack's base) show the tier's chip level: one pip per chip family, each getting brighter with every edition; all dark means no chip, all five bright means level 20. The Chip Upgrades card shows the same as small bars next to each tier.
 - **Offline earnings.** While the game is closed the data center you were in earns **75%** of its normal income, with no time limit.
 
 ### Themes
