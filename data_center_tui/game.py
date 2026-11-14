@@ -22,6 +22,7 @@ from itertools import accumulate, groupby
 from pathlib import Path
 from typing import Any, ClassVar, cast
 
+from rich.segment import Segment
 from rich.style import Style
 from rich.text import Text
 from textual import events
@@ -29,7 +30,9 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding, BindingType
 from textual.color import Color
 from textual.containers import Horizontal, Vertical
+from textual.geometry import Region
 from textual.screen import ModalScreen
+from textual.strip import Strip
 from textual.timer import Timer
 from textual.widget import Widget
 from textual.widgets import Input, RichLog, Static
@@ -179,16 +182,67 @@ ROW_W = 40  # inner width of the side cards
 # it and back. So when this pane isn't the one you're typing in, redraw only this often.
 BACKGROUND_REFRESH = 20  # seconds
 
-# Animation. Everything is derived from `phase` (advanced by the 1 s tick) plus a few short
-# effects. DC_ANIM=0 / --no-anim turns it all off. It never runs in a background tmux pane
-# or in a decommissioned data center. Effects born from a key press (sparkles, the
-# relocation transition, the balance flash) are stepped by a short-lived timer that exists
-# only while one is alive and the pane is in front; everything else rides the 1 s tick.
+# Animation. One clock (a single set_interval at ANIM_FPS) runs only while something can
+# move: ANIM on, this pane in front, a live (not decommissioned) data center. Motion is a
+# function of a time `t` in seconds from clock() (patchable in tests), never of a frame
+# count, so a dropped frame skips ahead instead of slowing down. The 1 s game tick is a
+# separate timer and the only place that asks tmux whether we are in front (frames never
+# shell out). DC_ANIM=0 / --no-anim turns all of it off.
 ANIM = os.environ.get("DC_ANIM", "1") != "0"
-FRAME_S = 0.2  # seconds per effect frame
+FPS_DEFAULT, FPS_MIN, FPS_MAX = 12.0, 4.0, 30.0
+
+
+def anim_fps(raw: str | None) -> float:
+    """Frames per second from DC_ANIM_FPS: default 12, anything unusable falls back to
+    the default, and the result is clamped to 4..30."""
+    try:
+        fps = float(raw) if raw else FPS_DEFAULT
+    except ValueError:
+        fps = FPS_DEFAULT
+    if not math.isfinite(fps):
+        fps = FPS_DEFAULT
+    return min(FPS_MAX, max(FPS_MIN, fps))
+
+
+ANIM_FPS = anim_fps(os.environ.get("DC_ANIM_FPS"))
+FRAME_S = 1 / ANIM_FPS  # seconds between frames
 BANNER_MIN_CONTRAST, FLOAT_MIN_CONTRAST = 3.0, 2.5  # WCAG ratios the fades never drop below
-FLOAT_LIFE, MAX_FLOATS = 2, 3  # ticks a floating +$X lives, and how many may be on screen
-SPARK_LIFE, RESOLVE_FRAMES, RELOC_FRAMES = 4, 4, 5
+MAX_FLOATS = 3  # floating +$X on screen at once
+FLOAT_ROWS, FLOAT_ROW_S = 7, 0.28  # a float rises FLOAT_ROWS rows, one per FLOAT_ROW_S on average
+FLOAT_LIFE_S = FLOAT_ROWS * FLOAT_ROW_S
+SPARK_LIFE_S, RESOLVE_S, CASH_FLASH_S = 0.8, 1.0, 0.6
+RELOC_S, RELOC_STAGGER_S, RELOC_FADE_S = 1.6, 0.25, 0.45
+LED_SLOT_S, LED_FADE = 0.6, 0.5  # an LED re-rolls every slot and fades over half of it
+PULSE_PX_S, PULSE_TAIL = 16.0, 5.0  # data pulse speed (pixels/s) and tail length
+TOP_PERIOD_S, BANNER_PERIOD_S, PULSE_STEPS = 3.0, 1.2, 8  # PULSE_STEPS quantises the top-tier glow
+
+
+def clock() -> float:
+    """Monotonic seconds. Every animation reads time from here so tests can patch it."""
+    return time.monotonic()
+
+
+def smoothstep(x: float) -> float:
+    """Ease in and out, clamped to 0..1."""
+    x = min(1.0, max(0.0, x))
+    return x * x * (3 - 2 * x)
+
+
+def ease_out(x: float) -> float:
+    """Fast start, gentle stop, clamped to 0..1."""
+    x = min(1.0, max(0.0, x))
+    return 1 - (1 - x) ** 2
+
+
+def sine01(t: float, period: float) -> float:
+    """Smooth 0..1..0 over `period` seconds, starting at 0."""
+    return 0.5 - 0.5 * math.cos(math.tau * t / period)
+
+
+def float_rows(age: float) -> float:
+    """Rows a floating +$X has risen after `age` seconds (ease-out, FLOAT_ROWS in total)."""
+    return FLOAT_ROWS * ease_out(age / FLOAT_LIFE_S)
+
 
 # Sprite legend: k frame, c tier colour, h highlight, d dark, w pale window/fan,
 # A/B blinking LEDs, . empty. One distinct silhouette per tier.
@@ -216,23 +270,21 @@ def mix32(*vals: int) -> int:
     return h
 
 
-def wave(phase: int, period: int = 4) -> float:
-    """Triangle wave 0..1..0 over `period` ticks."""
-    x = phase % period / period
-    return 1 - abs(2 * x - 1)
-
-
 @dataclass
 class Fx:
-    """One short-lived visual effect. `float` = rising "+$X" text (ages per tick);
-    `spark` = a burst of pixels around a rack (ages per effect frame)."""
+    """One short-lived visual effect, born at clock time `born` and alive for `life` seconds.
+    `float` = rising "+$X" text; `spark` = a burst of pixels around a rack."""
     kind: str
     seed: int
-    life: int
-    age: int = 0
+    life: float
+    born: float
     tier: int = 0
     text: str = ""
     big: bool = False
+
+    def progress(self, now: float) -> float:
+        """0.0 when born, 1.0 when it expires."""
+        return min(1.0, max(0.0, (now - self.born) / self.life))
 
 
 # ------------------------------------------------------------------ economy
@@ -498,17 +550,20 @@ def contrast(a: RGB, b: RGB) -> float:
     return (hi + 0.05) / (lo + 0.05)
 
 
-def ensure_contrast(fg: RGB, bg: RGB, minimum: float) -> RGB:
+def ensure_contrast(fg: RGB, bg: RGB, minimum: float, prefer: RGB | None = None) -> RGB:
     """Push `fg` towards black or white (whichever reads better on `bg`) until it reaches
-    the minimum contrast. A colour that already passes is returned unchanged."""
+    the minimum contrast. A colour that already passes is returned unchanged. `prefer`
+    names an end to try first, so a fading background doesn't flip the text between
+    black and white from one frame to the next."""
     if contrast(fg, bg) >= minimum:
         return fg
-    end: RGB = max(((0, 0, 0), (255, 255, 255)), key=lambda e: contrast(e, bg))
-    for step in range(1, 21):
-        c = mix(fg, end, step / 20)
-        if contrast(c, bg) >= minimum:
-            return c
-    return end
+    best: RGB = max(((0, 0, 0), (255, 255, 255)), key=lambda e: contrast(e, bg))
+    for end in ((prefer, best) if prefer else (best,)):
+        for step in range(1, 21):
+            c = mix(fg, end, step / 20)
+            if contrast(c, bg) >= minimum:
+                return c
+    return best
 
 
 # ------------------------------------------------------------------ palette
@@ -575,9 +630,30 @@ class Palette:
 
 # --------------------------------------------------------------------- hall
 
+Run = tuple[str, "RGB | None", "RGB | None"]  # a stretch of text with its fg / bg colour
+
+
+class StyleCache(dict[tuple["RGB | None", "RGB | None"], Style]):
+    """Rich Style objects are slow to parse: build each (fg, bg) pair once."""
+
+    def __missing__(self, key: tuple["RGB | None", "RGB | None"]) -> Style:
+        fg, bg = key
+        style = self[key] = Style(color=rgb(fg) if fg else None, bgcolor=rgb(bg) if bg else None)
+        return style
+
+
+STYLES = StyleCache()
+
 class Hall(Widget):
     """Pixel view of the racks you own, drawn with half-block characters. Racks are
     listed by tier (cheapest first); scroll with up/down/pageup/pagedown/home/end."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._rows: list[list[Run]] | None = None  # last picture, for row-level repaints
+        self._strips: dict[int, Strip] = {}
+        self._base_key: tuple[Any, ...] | None = None
+        self._base: tuple[list[list[RGB]], list[tuple[int, int, int, int]]] = ([], [])
 
     @property
     def game(self) -> "DataCenter":
@@ -602,122 +678,128 @@ class Hall(Widget):
         return cols, view_rows, total_rows, start
 
     @staticmethod
-    def led_lit(idx: int, y: int, x: int, phase: int, animating: bool) -> bool:
-        """Is this LED pixel lit? Blinks per tick when animating, else a fixed pattern."""
-        if animating:
-            return mix32(idx, y * 8 + x, phase) % 5 < 2
+    def led_lit(idx: int, y: int, x: int) -> bool:
+        """Is this LED pixel lit in a still hall (no animation)? A fixed pattern."""
         return (idx + y * 2 + x) % 3 == 0
 
+    @staticmethod
+    def led_level(idx: int, y: int, x: int, t: float) -> float:
+        """LED brightness 0..1 at time t: each LED re-rolls on/off once per slot (with its
+        own offset, so they never blink in step) and eases to the new state."""
+        key = y * 8 + x
+        s = t / LED_SLOT_S + (mix32(idx, key, 99) & 1023) / 1024
+        k = math.floor(s)
+        now = 1.0 if mix32(idx, key, k) % 5 < 2 else 0.0
+        before = 1.0 if mix32(idx, key, k - 1) % 5 < 2 else 0.0
+        return before + (now - before) * smoothstep((s - k) / LED_FADE)
+
     def render_reloc(self) -> Text:
-        """The relocation transition: a few frames of text before the new hall appears."""
+        """The relocation transition: lines fade in one after another, then all fade out."""
         game, p = self.game, self.game.pal
         reloc = cast(dict[str, Any], game.reloc)
+        age = game.now - reloc["t0"]
         lines = [("★ RELOCATING ★", p.primary), (f"Fame +{fmt(reloc['gain'])}", p.warning)]
         if reloc["rank"]:
             lines.append((f"Promoted: {reloc['rank']}!", p.success))
         lines.append((f"Welcome to {game.site_label(game.cur)}", p.fg))
         w, h = self.size.width, self.size.height
         top = max(0, (h - len(lines)) // 2)
+        out_fade = smoothstep((RELOC_S - age) / 0.3)  # the last 0.3 s fade everything away
         out = Text(no_wrap=True)
         for y in range(h):
             k = y - top
-            if 0 <= k < len(lines) and reloc["frame"] >= k:  # one more line each frame, fading in
+            if 0 <= k < len(lines):
                 text, colour = lines[k][0][:w], lines[k][1]
-                fade = min(1.0, (reloc["frame"] - k + 1) / 2)
-                out.append(" " * ((w - len(text)) // 2) + text,
-                           Style(color=rgb(mix(p.bg, colour, fade)), bold=True))
+                fade = smoothstep((age - k * RELOC_STAGGER_S) / RELOC_FADE_S) * out_fade
+                if fade > 0:
+                    out.append(" " * ((w - len(text)) // 2) + text,
+                               Style(color=rgb(mix(p.bg, colour, fade)), bold=True))
             out.append("\n")
         return out
 
     def draw_bus(self, grid: list[list[RGB]], first: int, shown: int, cols: int,
-                 ends: list[int]) -> None:
-        """A cable along the top of every rack row with a data pulse running down it."""
-        game, p = self.game, self.game.pal
+                 ends: list[int], t: float) -> None:
+        """A cable along the top of every rack row with a data pulse gliding down it. The
+        head sits at a fractional pixel: its two neighbours share the colour in proportion,
+        so it moves continuously rather than in cell steps."""
+        p = self.game.pal
         for r in range(-(-shown // cols)):
             width = min(cols, shown - r * cols) * CELL_W - 1
+            row = grid[r * CELL_H]
             for x in range(0, width, 2):
-                grid[r * CELL_H][x] = p.frame
-            head = (game.phase * 6 + r * 9) % width
-            for k in range(3):  # a bright head and a fading tail
-                x = head - k
-                if x >= 0:
+                row[x] = p.frame
+            head = (t * PULSE_PX_S + r * 9) % (width + PULSE_TAIL)
+            for x in range(max(0, math.ceil(head - PULSE_TAIL)), min(width, int(head) + 2)):
+                d = head - x  # distance behind the head; the leading edge blends in
+                a = 1 + d if d < 0 else (1 - d / PULSE_TAIL) ** 2
+                if a > 0:
                     colour = p.tiers[bisect_right(ends, first + r * cols + x // CELL_W)]
-                    grid[r * CELL_H][x] = mix(colour, p.frame, k / 3)
+                    row[x] = mix(row[x], colour, min(1.0, a))
 
     def draw_sparks(self, grid: list[list[RGB]], first: int, shown: int, cols: int,
                     ends: list[int]) -> None:
-        """Sparkle bursts around the rack that was just bought (hall centre if off screen)."""
+        """Sparkle bursts around the rack that was just bought (hall centre if off screen):
+        the sparks fly out with ease-out and fade smoothly."""
         game, p = self.game, self.game.pal
         gh, gw = len(grid), len(grid[0])
         for fx in game.fx:
             if fx.kind != "spark":
                 continue
+            u = fx.progress(game.now)
             j = ends[fx.tier] - 1 - first if game.owned[fx.tier] else -1
             cx, cy = (((j % cols) * CELL_W + 3, (j // cols) * CELL_H + 4) if 0 <= j < shown
                       else (gw // 2, gh // 2))
             base = p.warning if fx.big else mix(p.tiers[fx.tier], p.fg, 0.5)
-            colour = mix(base, p.bg, fx.age / fx.life)
+            colour = mix(base, p.bg, smoothstep(u))
             for i in range(20 if fx.big else 9):
                 h = mix32(fx.seed, i)
-                reach = 1 + (h >> 8 & 3) * 0.5 + fx.age * 2
+                reach = 1 + (h >> 8 & 3) * 0.5 + 8 * ease_out(u)
                 x = cx + round(math.cos((h & 255) * math.tau / 256) * reach)
                 y = cy + round(math.sin((h & 255) * math.tau / 256) * reach)
                 if 0 <= x < gw and 0 <= y < gh:
                     grid[y][x] = colour
 
     def draw_floats(self, cells: list[list[tuple[str, RGB, RGB]]]) -> None:
-        """Rising "+$X" text over the hall."""
+        """Rising "+$X" text over the hall: it climbs with ease-out and fades near the top."""
         game, p = self.game, self.game.pal
         gw = len(cells[0])
         for fx in game.fx:
-            y = len(cells) - 2 - 2 * fx.age
-            if fx.kind != "float" or y < 0:
+            if fx.kind != "float":
+                continue
+            u = fx.progress(game.now)
+            y = len(cells) - 2 - round(float_rows(u * FLOAT_LIFE_S))
+            if y < 0:
                 continue
             x0 = 1 + mix32(fx.seed, 1) % max(1, gw - len(fx.text) - 1)
-            colour = mix(p.success, p.bg, 0.5 * fx.age / fx.life)
+            colour = mix(p.success, p.bg, 0.5 * smoothstep((u - 0.5) / 0.5))
             for i, ch in enumerate(fx.text[:gw - x0]):
                 under = cells[y][x0 + i][2]
                 cells[y][x0 + i] = (ch, ensure_contrast(colour, under, FLOAT_MIN_CONTRAST), under)
 
-    def render(self) -> Text:
+    def base_grid(self, first: int, shown: int, cols: int, view_rows: int, ends: list[int],
+                  pulse: int) -> tuple[list[list[RGB]], list[tuple[int, int, int, int]]]:
+        """Everything that doesn't move: backdrop, sprites, shadows. Also the LED pixels as
+        (x, y, rack index, sprite position). Cached; see render()."""
         game, p = self.game, self.game.pal
-        total = sum(game.owned)
-        animating = game.animating
-        if animating and game.reloc is not None:
-            return self.render_reloc()
-        if not total:
-            return Text("\n  Empty hall. Press 1 to buy your first server.", style=rgb(p.muted))
-        w = self.size.width
-        cols, view_rows, total_rows, start = self.rack_layout()
-        first = start * cols
-        shown = min(total - first, view_rows * cols)
-        ends = list(accumulate(game.owned))  # racks are ordered by tier: find each one's tier
         gw, gh = cols * CELL_W, view_rows * CELL_H
         grid: list[list[RGB]] = [
             [mix(p.bg, p.surface, y / max(1, gh - 1))] * gw for y in range(gh)
         ]
-        dead = game.read_only
-        top = game.top_tier()
-        led_on = p.alert_on if game.crisis and not dead else p.led_on
-        led_off = p.alert_off if game.crisis and not dead else p.led_off
-        if dead:  # decommissioned: every light is off
-            led_on = led_off = mix(p.frame, p.bg, 0.4)
+        leds: list[tuple[int, int, int, int]] = []
+        dead, top = game.read_only, game.top_tier()
         for j in range(shown):
             idx = first + j
             tier = bisect_right(ends, idx)
             ox, oy = (j % cols) * CELL_W, (j // cols) * CELL_H + 1
             colour = p.tiers[tier]
-            if animating and tier == top:  # gentle pulse on the best earner
-                colour = mix(colour, p.fg, 0.25 * wave(game.phase))
+            if game.animating and tier == top:  # gentle pulse on the best earner
+                colour = mix(colour, p.fg, 0.25 * pulse / PULSE_STEPS)
             if dead:  # washed out to grey
                 grey = int(lum(colour) * 255)
                 colour = mix((grey, grey, grey), p.surface, 0.55)
             palette: dict[str, RGB] = {
-                "k": p.frame,
-                "c": colour,
-                "h": mix(colour, (255, 255, 255), 0.35),
-                "d": mix(colour, (0, 0, 0), 0.5),
-                "w": mix(colour, (255, 255, 255), 0.6),
+                "k": p.frame, "c": colour, "h": mix(colour, (255, 255, 255), 0.35),
+                "d": mix(colour, (0, 0, 0), 0.5), "w": mix(colour, (255, 255, 255), 0.6),
             }
             for x in range(1, 6):  # soft floor shadow
                 grid[oy + 6][ox + x] = p.shadow
@@ -726,13 +808,52 @@ class Hall(Widget):
                     if ch == ".":
                         continue
                     if ch in "AB":
-                        on = self.led_lit(idx, y, x, game.phase, animating)
-                        grid[oy + y][ox + x] = led_on if on else led_off
+                        leds.append((ox + x, oy + y, idx, y * 8 + x))
                     else:
                         grid[oy + y][ox + x] = palette[ch]
+        return grid, leds
+
+    def special(self) -> Text | None:
+        """The hall's text-only states (relocation transition, empty hall), else None."""
+        game, p = self.game, self.game.pal
+        if game.animating and game.reloc is not None:
+            return self.render_reloc()
+        if not sum(game.owned):
+            return Text("\n  Empty hall. Press 1 to buy your first server.", style=rgb(p.muted))
+        return None
+
+    def build_rows(self) -> list[list[Run]]:
+        """The picture as rows of runs (text, fg, bg): pixel hall, effects and scrollbar."""
+        game, p = self.game, self.game.pal
+        total, animating = sum(game.owned), game.animating
+        w, t = self.size.width, game.now
+        cols, view_rows, total_rows, start = self.rack_layout()
+        first = start * cols
+        shown = min(total - first, view_rows * cols)
+        ends = list(accumulate(game.owned))  # racks are ordered by tier: find each one's tier
+        gw, gh = cols * CELL_W, view_rows * CELL_H
+        dead = game.read_only
+        pulse = round(PULSE_STEPS * sine01(t, TOP_PERIOD_S)) if animating else 0
+        key = (game.pal_serial, tuple(game.owned), game.top_tier(), first, shown, cols, view_rows, dead,
+               animating, pulse)
+        if self._base_key != key:  # sprites only change when the layout or the pulse step does
+            self._base_key = key
+            self._base = self.base_grid(first, shown, cols, view_rows, ends, pulse)
+        base, leds = self._base
+        grid = [row[:] for row in base]
+        alert = game.crisis is not None and not dead
+        led_on = p.alert_on if alert else p.led_on
+        led_off = p.alert_off if alert else p.led_off
+        if dead:  # decommissioned: every light is off
+            led_on = led_off = mix(p.frame, p.bg, 0.4)
+        for x, y, idx, pos in leds:
+            if animating:
+                grid[y][x] = mix(led_off, led_on, self.led_level(idx, pos // 8, pos % 8, t))
+            else:
+                grid[y][x] = led_on if self.led_lit(idx, pos // 8, pos % 8) else led_off
         if animating:
             if not game.crisis:  # data stops flowing while something is broken
-                self.draw_bus(grid, first, shown, cols, ends)
+                self.draw_bus(grid, first, shown, cols, ends, t)
             self.draw_sparks(grid, first, shown, cols, ends)
         # scrollbar on the right edge when there are more racks than fit
         lines = gh // 2
@@ -744,18 +865,60 @@ class Hall(Widget):
         cells = [[("▀", grid[y][x], grid[y + 1][x]) for x in range(gw)] for y in range(0, gh, 2)]
         if animating:
             self.draw_floats(cells)
-        # Merge runs of identical cells into single segments: far fewer bytes
-        # per frame, which keeps a background tmux pane quiet.
-        out = Text(no_wrap=True)
+        rows: list[list[Run]] = []
         for line, row in enumerate(cells):
-            for (ch, fg, bg), run in groupby(row):
-                out.append(ch * len(list(run)), Style(color=rgb(fg), bgcolor=rgb(bg)))
+            # Merge runs of identical cells into single segments: far fewer bytes per frame.
+            runs: list[Run] = [(ch * len(list(run)), fg, bg) for (ch, fg, bg), run in groupby(row)]
             if scrolled:
-                out.append(" " * max(0, w - gw - 1))
+                runs.append((" " * max(0, w - gw - 1), None, None))
                 thumb = thumb_pos <= line < thumb_pos + thumb_len
-                out.append(" ", Style(bgcolor=rgb(p.muted if thumb else p.frame)))
+                runs.append((" ", None, p.muted if thumb else p.frame))
+            rows.append(runs)
+        return rows
+
+    def render(self) -> Text:
+        text = self.special()
+        if text is not None:
+            return text
+        out = Text(no_wrap=True)
+        for runs in self.build_rows():
+            for chars, fg, bg in runs:
+                out.append(chars, Style(color=rgb(fg) if fg else None,
+                                        bgcolor=rgb(bg) if bg else None))
             out.append("\n")
         return out
+
+    # -- partial repaints: only the terminal rows that changed are rendered again --------
+
+    def update_rows(self) -> None:
+        """Rebuild the picture and ask Textual to repaint just the rows that differ."""
+        if self.special() is not None:  # text states go through the normal render() path
+            self._rows = None
+            self.refresh()
+            return
+        rows = self.build_rows()
+        old = self._rows
+        self._rows = rows
+        self._strips = {}
+        if old is None or len(old) != len(rows):
+            self.refresh()
+            return
+        dirty = [Region(0, y, self.size.width, 1) for y, (a, b) in enumerate(zip(old, rows))
+                 if a != b]
+        if dirty:
+            self.refresh(*dirty)
+
+    def render_line(self, y: int) -> Strip:
+        if self._rows is None:
+            return super().render_line(y)
+        if y >= len(self._rows):
+            return Strip.blank(self.size.width, self.rich_style)
+        strip = self._strips.get(y)
+        if strip is None:
+            base = self.rich_style  # the hall's own colours: padding must keep its background
+            segs = [Segment(chars, base + STYLES[(fg, bg)]) for chars, fg, bg in self._rows[y]]
+            strip = self._strips[y] = Strip(segs).adjust_cell_length(self.size.width, base)
+        return strip
 
 
 # ------------------------------------------------------------------- dialogs
@@ -993,16 +1156,20 @@ class DataCenter(App):
         self.foreground = True
         self.fx: list[Fx] = []
         self.fx_seq = 0  # numbers the effects: their look is a function of this and the phase
+        self.now = clock()  # animation time, refreshed by every frame and redraw
         self.cash_flash = 0  # +1 balance just rose, -1 it just fell, 0 no flash
-        self.resolve_flash, self.resolved = 0, ""
+        self.cash_t0 = 0.0
+        self.resolve_t0: float | None = None  # when the crisis was fixed, while the banner fades
+        self.resolved = ""
         self.reloc: dict[str, Any] | None = None  # the relocation transition, while it plays
-        self._burst: Timer | None = None
+        self._anim_timer: Timer | None = None
         self._alert_bg: RGB | None = None
         self.hall_scroll: int | None = None  # None = follow the newest racks at the bottom
         self._pal: Palette | None = None
         self._last: dict[str, Text] = {}
         self._titles: dict[str, str] = {}
         self._hall_sig: tuple[Any, ...] | None = None
+        self.pal_serial = 0  # bumped whenever the palette is rebuilt
         self._seen_balance = self.site_balance[self.cur]
         # Offline earnings: 75% of income for the time since the last save
         self.away = (0.0, 0)
@@ -1047,6 +1214,7 @@ class DataCenter(App):
     @property
     def pal(self) -> Palette:
         if self._pal is None:
+            self.pal_serial += 1  # a real identity: id() of a freed palette can be reused
             # Read the named theme directly: theme_variables lags behind a fresh
             # `self.theme = ...` assignment during startup.
             theme = self.get_theme(self.theme)
@@ -1157,7 +1325,7 @@ class DataCenter(App):
                 f"Welcome back! Away {fmt_duration(self.away[0])}, "
                 f"earned ${fmt(self.away[1])} ({OFFLINE_NUM * 100 // OFFLINE_DEN}% offline rate)",
                 style=rgb(self.pal.warning)))
-        self.set_interval(1.0, self.tick)  # one frame per second keeps tmux calm
+        self.set_interval(1.0, self.tick)  # the game tick; animation has its own clock
         self.redraw()
         if ONLINE and not self.online_asked:
             self.call_after_refresh(self.ask_to_join)
@@ -1165,8 +1333,16 @@ class DataCenter(App):
     def on_resize(self, event: events.Resize) -> None:
         self.redraw()  # titles and windows depend on the size
 
+    def on_unmount(self) -> None:
+        self.stop_clock()
+
     def on_theme_changed(self, _theme: object) -> None:
         self._pal = None
+        STYLES.clear()
+        self._hall_sig = None  # forget the cached hall picture: it holds the old colours
+        hall = self.query_one(Hall)
+        hall._rows, hall._base_key = None, None
+        hall._strips = {}
         self.redraw()
         self.save()
 
@@ -1236,86 +1412,110 @@ class DataCenter(App):
             t, self.owned[t], self.chips[t], self.cur) * crew_multiplier(self.staff[t]))
         return best if self.owned[best] else None
 
-    def add_fx(self, kind: str, life: int, **kw: Any) -> None:
+    def add_fx(self, kind: str, life: float, **kw: Any) -> None:
         self.fx_seq += 1
-        self.fx.append(Fx(kind, mix32(self.fx_seq, self.phase), life, **kw))
+        self.now = clock()
+        self.fx.append(Fx(kind, mix32(self.fx_seq, self.phase), life, self.now, **kw))
 
     def sparkle(self, tier: int, big: bool = False) -> None:
         """A burst around a rack: a small one for a purchase, a big one for a milestone."""
         if self.animating:
-            self.add_fx("spark", SPARK_LIFE, tier=tier, big=big)
-            self.start_burst()
+            self.add_fx("spark", SPARK_LIFE_S, tier=tier, big=big)
+            self.sync_clock()
 
     def anim_tick(self) -> None:
-        """Once a second: age the floating text and launch a new one while money lands."""
+        """Once a second: launch a new floating +$X while money lands, and make sure the
+        frame clock matches whether we are in front (this reads self.foreground, which
+        tick() cached: frames never ask tmux)."""
         if not self.animating:
             self.clear_fx()
             return
-        for fx in self.fx:
-            fx.age += fx.kind == "float"
-        self.fx = [fx for fx in self.fx if fx.kind != "float" or fx.age < fx.life]
+        self.now = clock()
+        self.expire_fx()
         floats = sum(fx.kind == "float" for fx in self.fx)
         if self.income > 0 and floats < MAX_FLOATS:
-            self.add_fx("float", FLOAT_LIFE, text=f"+${fmt(self.income)}")
+            self.add_fx("float", FLOAT_LIFE_S, text=f"+${fmt(self.income)}")
+        self.sync_clock()
 
-    def advance_fast(self) -> bool:
-        """Step the effects that run faster than the tick. True while any is still playing."""
-        self.cash_flash = 0
-        for fx in self.fx:
-            fx.age += fx.kind == "spark"
-        self.fx = [fx for fx in self.fx if fx.kind != "spark" or fx.age < fx.life]
-        self.resolve_flash = max(0, self.resolve_flash - 1)
-        if self.reloc is not None:
-            self.reloc["frame"] += 1
-            if self.reloc["frame"] >= RELOC_FRAMES:
-                self.reloc = None
-        return (any(fx.kind == "spark" for fx in self.fx) or self.resolve_flash > 0
-                or self.reloc is not None)
+    def expire_fx(self) -> None:
+        """Drop every effect whose time is up (compares against self.now)."""
+        self.fx = [fx for fx in self.fx if self.now - fx.born < fx.life]
+        if self.cash_flash and self.now - self.cash_t0 >= CASH_FLASH_S:
+            self.cash_flash = 0
+        if self.resolve_t0 is not None and self.now - self.resolve_t0 >= RESOLVE_S:
+            self.resolve_t0 = None
+        if self.reloc is not None and self.now - self.reloc["t0"] >= RELOC_S:
+            self.reloc = None
 
-    def start_burst(self) -> None:
-        """Short-lived frame timer: it exists only while an effect plays in a front pane."""
-        if self._burst is None and self.animating:
-            self._burst = self.set_interval(FRAME_S, self.anim_frame)
+    def needs_frames(self) -> bool:
+        """Does anything on screen move? An empty, calm hall costs no frames at all."""
+        return self.animating and bool(
+            sum(self.owned) or self.fx or self.crisis or self.resolve_t0 is not None
+            or self.cash_flash or self.reloc is not None)
 
-    def stop_burst(self) -> None:
-        if self._burst is not None:
-            self._burst.stop()
-            self._burst = None
+    def sync_clock(self) -> None:
+        """Run the single frame timer exactly while there is something to animate."""
+        if self.is_running and self.needs_frames():
+            if self._anim_timer is None:
+                self._anim_timer = self.set_interval(FRAME_S, self.anim_frame)
+        else:
+            self.stop_clock()
+
+    def stop_clock(self) -> None:
+        if self._anim_timer is not None:
+            self._anim_timer.stop()
+            self._anim_timer = None
 
     def anim_frame(self) -> None:
-        if not self.is_running:  # the timer can fire while the app is shutting down
-            self.stop_burst()
+        """One animation frame: advance the clock, then repaint only what moves."""
+        if not (self.is_running and self.animating):  # also fires while shutting down
+            self.clear_fx()
             return
-        if not (self.animating and self.advance_fast()):
-            self.stop_burst()
-        self.redraw()
+        self.now = clock()
+        self.expire_fx()
+        self.draw_cash()
+        self.draw_alert()
+        self.draw_hall()
+        self.sync_clock()
 
     def clear_fx(self) -> None:
         """Drop every effect (background pane, old data center, animation off)."""
         self.fx.clear()
-        self.cash_flash = self.resolve_flash = 0
+        self.cash_flash = 0
+        self.resolve_t0 = None
         self.reloc = None
-        self.stop_burst()
+        self.stop_clock()
 
     def alert_banner(self, msg: str) -> Text:
-        """The crisis banner: red/dark bars flicker while it lasts, a calm fade once fixed."""
+        """The crisis banner: it pulses red on a smooth sine while it lasts, then fades
+        calmly to green once fixed. Text contrast is re-checked on every frame."""
         p = self.pal
         if not self.animating:
             self._set_alert_bg(None)
             return Text(msg)
         calm = self.crisis is None
-        flick = self.phase % 2 == 0
-        if calm:
-            bg, fg = mix(p.success, p.bg, 0.8 * (1 - self.resolve_flash / RESOLVE_FRAMES)), p.bg
-        else:
-            bg, fg = (p.error, p.bg) if flick else (mix(p.error, p.bg, 0.75), p.error)
-        fg = ensure_contrast(fg, bg, BANNER_MIN_CONTRAST)  # fades and flicker stay readable
+        # Dim as far as the text colour still reads on it: the fade is as deep as this
+        # theme allows without the text having to change colour mid-fade.
+        hi = p.success if calm else p.error
+        lo = hi
+        for k in (0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1):
+            if k <= (0.8 if calm else 0.6) and contrast(p.bg, mix(hi, p.bg, k)) >= BANNER_MIN_CONTRAST:
+                lo = mix(hi, p.bg, k)
+                break
+        if calm:  # fades out as the fix settles
+            bg = mix(hi, lo, ease_out((self.now - (self.resolve_t0 or self.now)) / RESOLVE_S))
+        else:  # pulses on a sine
+            bg = mix(lo, hi, sine01(self.now, BANNER_PERIOD_S))
+        end = max(((0, 0, 0), (255, 255, 255)),
+                  key=lambda e: min(contrast(e, lo), contrast(e, hi)))  # one end for the whole fade
+        # Text is the theme background colour when that reads over the whole fade, else a
+        # fixed black/white: it never flips mid-pulse. Contrast is re-checked every frame.
+        base = p.bg if min(contrast(p.bg, lo), contrast(p.bg, hi)) >= BANNER_MIN_CONTRAST else end
+        fg = ensure_contrast(base, bg, BANNER_MIN_CONTRAST, end)
         self._set_alert_bg(bg)
         width = max(0, self.size.width - 4)
-        if len(msg) + 10 <= width:
-            if not calm:
-                left, right = ("▓▒░", "░▒▓") if flick else ("░▒▓", "▓▒░")
-                msg = f"{left} {msg} {right}"
+        if len(msg) + 10 <= width and not calm:
+            msg = f"▓▒░ {msg} ░▒▓"
         return Text(msg.ljust(width), style=f"bold {rgb(fg)} on {rgb(bg)}")
 
     def _set_alert_bg(self, bg: RGB | None) -> None:
@@ -1562,8 +1762,9 @@ class DataCenter(App):
         self.crisis = None
         who = "You" if fixer is None else STAFF[fixer][0]
         if self.animating:
-            self.resolve_flash, self.resolved = RESOLVE_FRAMES, f"✓ {who} fixed '{title}'"
-            self.start_burst()
+            self.now = clock()
+            self.resolve_t0, self.resolved = self.now, f"✓ {who} fixed '{title}'"
+            self.sync_clock()
         self.say(f"✓ {who} fixed '{title}' {self.rng.choice(FIX_QUIPS)}", self.pal.success)
 
     def action_fix(self) -> None:
@@ -1726,8 +1927,10 @@ class DataCenter(App):
                 self.say(f"★ Promoted: {after}!", p.warning)
             if self.animating:
                 self.fx.clear()
-                self.reloc = {"frame": 0, "gain": gain, "rank": after if after != before else None}
-                self.start_burst()
+                self.now = clock()
+                self.reloc = {"t0": self.now, "gain": gain,
+                              "rank": after if after != before else None}
+                self.sync_clock()
             self.maybe_submit(force=True)
         self.redraw()
         self.save()
@@ -1761,18 +1964,56 @@ class DataCenter(App):
             self._titles[wid] = title
             self.query_one(wid).border_title = title
 
-    def redraw(self) -> None:
+    def draw_cash(self) -> None:
+        """The balance; after a change it flashes and eases back to the normal colour."""
         p = self.pal
-        if not self.animating:
-            self.clear_fx()
-        if self.animating and self.balance != self._seen_balance:
-            self.cash_flash = 1 if self.balance > self._seen_balance else -1
-            self.start_burst()
-        self._seen_balance = self.balance
-        tint = {1: mix(p.success, p.fg, 0.7), -1: p.warning}.get(self.cash_flash)
+        tint = None
+        if self.cash_flash:
+            base = mix(p.success, p.fg, 0.7) if self.cash_flash > 0 else p.warning
+            tint = mix(base, p.fg, smoothstep((self.now - self.cash_t0) / CASH_FLASH_S))
         self.set_text("#cash", Text.assemble(
             ("$ ", rgb(p.muted)), (fmt(self.balance), f"bold {rgb(tint)}") if tint
             else fmt(self.balance)))
+
+    def draw_alert(self) -> None:
+        c = self.crisis
+        show = c is not None or self.resolve_t0 is not None
+        alert = self.query_one("#alert", Static)
+        if alert.display != show:  # re-assigning it forces a repaint
+            alert.display = show
+        if c is not None:
+            num, den = CRISIS_FACTOR[c["sev"]]
+            who = (f"{STAFF[c['fixer']][0]} responding ({c['eta']}s)"
+                   if c["fixer"] is not None else "press F to fix")
+            self.set_text("#alert", self.alert_banner(
+                f"⚠ {c['title']}  ·  income -{100 - num * 100 // den}%  ·  {who}"))
+        elif show:
+            self.set_text("#alert", self.alert_banner(self.resolved))
+
+    def draw_hall(self) -> None:
+        """Repaint the hall only if its look changed: the signature holds the layout plus
+        the current frame number while anything moves."""
+        anim = self.animating
+        moving = anim and bool(sum(self.owned) or self.fx or self.reloc)
+        sig = (self.cur, self.sites, tuple(self.owned), self.crisis is not None, self.pal_serial,
+               self.hall_scroll, self.query_one(Hall).size, int(self.now * ANIM_FPS) if moving else 0, anim,
+               tuple((f.kind, f.seed) for f in self.fx), self.reloc is not None)
+        if sig != self._hall_sig:  # a static hall costs nothing to leave alone
+            self._hall_sig = sig
+            self.query_one(Hall).update_rows()
+
+    def redraw(self) -> None:
+        p = self.pal
+        self.now = clock()
+        if not self.animating:
+            self.clear_fx()
+        else:
+            self.expire_fx()
+        if self.animating and self.balance != self._seen_balance:
+            self.cash_flash = 1 if self.balance > self._seen_balance else -1
+            self.cash_t0 = self.now
+        self._seen_balance = self.balance
+        self.draw_cash()
 
         rank, rank_need, _ = rank_of(self.fame)
         self.set_text("#title", Text.assemble(
@@ -1822,19 +2063,7 @@ class DataCenter(App):
         self.set_title("#shop", titles[self.side])
         self.set_text("#shop", body)
 
-        c = self.crisis
-        show = c is not None or self.resolve_flash > 0
-        alert = self.query_one("#alert", Static)
-        if alert.display != show:  # re-assigning it forces a repaint
-            alert.display = show
-        if c is not None:
-            num, den = CRISIS_FACTOR[c["sev"]]
-            who = (f"{STAFF[c['fixer']][0]} responding ({c['eta']}s)"
-                   if c["fixer"] is not None else "press F to fix")
-            self.set_text("#alert", self.alert_banner(
-                f"⚠ {c['title']}  ·  income -{100 - num * 100 // den}%  ·  {who}"))
-        elif show:
-            self.set_text("#alert", self.alert_banner(self.resolved))
+        self.draw_alert()
 
         _, view_rows, total_rows, start = self.query_one(Hall).rack_layout()
         title = f"#{self.cur + 1} {self.site_label(self.cur)} · {sum(self.owned):,} racks"
@@ -1843,14 +2072,8 @@ class DataCenter(App):
         if total_rows > view_rows:
             title += f" · rows {start + 1}-{start + view_rows}/{total_rows} ↑↓"
         self.set_title("#hall", title)
-        anim = self.animating
-        sig = (self.cur, self.sites, tuple(self.owned), self.crisis is not None, id(p), self.hall_scroll,
-               self.phase if anim and sum(self.owned) else 0, anim,
-               tuple((f.kind, f.seed, f.age) for f in self.fx),
-               self.reloc["frame"] if self.reloc else -1)
-        if sig != self._hall_sig:  # a static hall costs nothing to leave alone
-            self._hall_sig = sig
-            self.query_one(Hall).refresh()
+        self.draw_hall()
+        self.sync_clock()
 
     def row(self, text: Text, index: int, name: str, badge: str, accent: str,
             name_style: str, badge_style: str) -> None:
@@ -2028,7 +2251,7 @@ def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
         prog="data-center-tui", description="A pixel-art idle tycoon for your terminal.",
         epilog="Environment: DC_SAVE (save file), DC_ONLINE=0 (no online features), "
-               "DC_SERVER (leaderboard server URL), DC_ANIM=0 (no animation).")
+               "DC_SERVER (leaderboard server URL), DC_ANIM=0 (no animation), DC_ANIM_FPS (4-30, default 12).")
     parser.add_argument("--version", action="version", version=f"data-center-tui {__version__}")
     parser.add_argument("--no-online", action="store_true",
                         help="never contact the leaderboard server (same as DC_ONLINE=0)")
