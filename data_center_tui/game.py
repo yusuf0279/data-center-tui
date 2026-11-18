@@ -229,6 +229,17 @@ TOP_PERIOD_S, BANNER_PERIOD_S, PULSE_STEPS = 3.0, 1.2, 8  # PULSE_STEPS quantise
 # sends only the changed cells; spans closer than SPAN_GAP unchanged cells are sent as one.
 SLOW_FPS, LED_LEVELS, SPAN_GAP = 6.0, 4, 2
 SLOW_HZ = ANIM_FPS / max(1, round(ANIM_FPS / SLOW_FPS))  # every n-th frame: no uneven beat
+# Crew sprites, chip deliveries and server build-ins (all visuals only: the game state changes
+# at once, these just show it arriving). Every time here is in seconds of clock().
+CREW_W, CREW_H = 5, 6  # a person: 5x6 pixels, in a right margin the hall reserves for them
+CREW_MARGIN = CREW_W + 1
+CREW_DY = 1  # a person stands one pixel lower than a rack: the two bob rows are then exactly one text line
+CREW_BOB_S = 0.5  # the idle bob flips every half second: ~2 Hz, and only the body text line changes
+APPEAR_S, TRAIN_S, INSTALL_S, BUILD_S = 0.5, 0.6, 0.5, 0.4
+TRUCK_W, TRUCK_H = 9, 5
+TRUCK_PX_S, TRUCK_PARK_S, TRUCK_MIN_S, TRUCK_MAX_S = 24.0, 0.3, 0.6, 2.5
+MAX_TRUCKS, MAX_BUILDS = 2, 12  # concurrent delivery trucks / build-in effects
+CREW_MIN_CONTRAST = 3.0  # every part of a person or truck against the backdrop
 
 
 def clock() -> float:
@@ -269,6 +280,18 @@ SPRITES: list[list[str]] = [
 ]
 CELL_W, CELL_H = 7, 8  # 6x6 sprite, one gap column, shadow row at the bottom
 
+# A crew member (a, hat: its colour is the training level; s skin; c the tier colour; d legs)
+# and the truck that brings chips (c cargo in the tier colour, h highlight, k cab, w window,
+# d wheels). The idle bob differs from the first frame in the two body rows only: one text line.
+CREW_FRAMES: dict[str, list[str]] = {
+    "idle0": [".aaa.", ".sss.", "ccccc", ".ccc.", ".d.d.", "dd.dd"],
+    "idle1": [".aaa.", ".sss.", ".ccc.", "ccccc", ".d.d.", "dd.dd"],
+    "work": ["caaac", "csssc", ".ccc.", ".ccc.", ".d.d.", "dd.dd"],  # arms up: installing
+}
+TRUCK = ["..ccccccc", "kkkcchhcc", "kwkcccccc", "kkkkkkkkk", ".dd...dd."]  # facing left
+HAT_NEUTRAL_MIX, HAT_HUE0, HAT_HUE_STEP = 0.3, 240, 27  # hat hue (degrees) of Lv1, and per level
+SKIN: RGB = (226, 184, 148)
+
 
 def mix32(*vals: int) -> int:
     """Small deterministic integer hash: the same inputs always give the same frame."""
@@ -282,13 +305,17 @@ def mix32(*vals: int) -> int:
 @dataclass
 class Fx:
     """One short-lived visual effect, born at clock time `born` and alive for `life` seconds.
-    `spark` = a burst of pixels around a rack."""
+    `spark` = a burst of pixels around a rack; `build` = a rack materialising; `appear` / `train` /
+    `install` = a crew member popping in, levelling up, installing; `truck` = a chip delivery."""
     kind: str
     seed: int
     life: float
     born: float
     tier: int = 0
     big: bool = False
+    slot: int = 0  # build: which rack of the tier is arriving
+    span: float = 0.0  # truck: seconds it takes to drive in; the chips land then
+    arrived: bool = False  # truck: the chips have been installed
 
     def progress(self, now: float) -> float:
         """0.0 when born, 1.0 when it expires."""
@@ -736,6 +763,17 @@ class Layout:
     total_rows: int
     tier_block: list[int]  # index of each tier's header block (-1: none owned)
     tier_first: list[int]  # index of each tier's first rack
+    reserve: int = 0  # pixel columns kept free right of the racks for the crew sprites
+
+    @property
+    def grid_w(self) -> int:
+        """Pixels across the whole picture: the racks plus the crew margin."""
+        return self.cols * CELL_W + self.reserve
+
+    @property
+    def crew_x(self) -> int:
+        """Left pixel column of the crew sprites (the last rack's gap column is their gap)."""
+        return self.cols * CELL_W
 
     @property
     def scrolled(self) -> bool:
@@ -782,6 +820,7 @@ class Hall(Widget):
         self._base_key: tuple[Any, ...] | None = None
         self._base: tuple[list[list[RGB]], list[tuple[int, int, int, int]]] = ([], [])
         self._blocks_owned: tuple[int, ...] = ()
+        self._crew_cache: dict[tuple[Any, ...], list[tuple[int, int, RGB]]] = {}
         self._blocks: dict[int, tuple[list[Block], int, list[int], list[int]]] = {}  # by columns
 
     @property
@@ -823,13 +862,20 @@ class Hall(Widget):
         the bottom unless the player scrolled (game.hall_scroll is a block number)."""
         game = self.game
         w, height = self.size.width, max(self.size.height, HEADER_LINES + RACK_LINES)
-        cols = max(1, w // CELL_W)
+        # Once somebody is hired a right margin holds the crew; a hall too narrow for a rack
+        # beside it goes without crew sprites rather than lose racks.
+        reserve = CREW_MARGIN if any(s >= 0 and n for s, n in zip(game.staff, game.owned)) else 0
+        if w - reserve < CELL_W:
+            reserve = 0
+        cols = max(1, (w - reserve) // CELL_W)
         blocks, total, tier_block, tier_first = self.make_blocks(cols)
         if total > height:  # a scrollbar needs one column of its own
-            cols = max(1, (w - 1) // CELL_W)
+            if reserve and w - reserve - 1 < CELL_W:  # no room for rack + margin + bar
+                reserve = 0
+            cols = max(1, (w - reserve - 1) // CELL_W)
             blocks, total, tier_block, tier_first = self.make_blocks(cols)
         lay = Layout(cols, height, blocks, 0, 0, total, sum(b.kind == "rack" for b in blocks),
-                     tier_block, tier_first)
+                     tier_block, tier_first, reserve)
         lay.start = lay.max_start if game.hall_scroll is None else min(game.hall_scroll, lay.max_start)
         lay.end, used = lay.start, 0
         while lay.end < len(blocks) and used + blocks[lay.end].height <= height:
@@ -932,10 +978,8 @@ class Hall(Widget):
         """Everything that doesn't move: backdrop, sprites, chip pips. Also the LED pixels as
         (x, y, rack index, sprite position). Cached; see build_cells()."""
         game, p = self.game, self.game.pal
-        gw, gh = lay.cols * CELL_W, lay.used * 2
-        grid: list[list[RGB]] = [
-            [mix(p.bg, p.surface, y / max(1, gh - 1))] * gw for y in range(gh)
-        ]
+        gw, gh = lay.grid_w, lay.used * 2
+        grid: list[list[RGB]] = [[self.backdrop(y, gh)] * gw for y in range(gh)]
         leds: list[tuple[int, int, int, int]] = []
         top = game.top_tier()
         for b in lay.blocks[lay.start:lay.end]:
@@ -950,7 +994,7 @@ class Hall(Widget):
                 "k": p.frame, "c": colour, "h": mix(colour, (255, 255, 255), 0.35),
                 "d": mix(colour, (0, 0, 0), 0.5), "w": mix(colour, (255, 255, 255), 0.6),
             }
-            pips = [pip_colour(s, hue, p.pip_floor) for s in chip_pips(game.chips[tier])]
+            pips = [pip_colour(s, hue, p.pip_floor) for s in chip_pips(game.shown_chip(tier))]
             for c in range(b.count):
                 ox, idx = c * CELL_W, b.first + c
                 for x, pip in enumerate(pips):  # the floor shadow row doubles as the chip level
@@ -964,6 +1008,156 @@ class Hall(Widget):
                         else:
                             grid[oy + y][ox + x] = palette[ch]
         return grid, leds
+
+    def backdrop(self, y: int, gh: int) -> RGB:
+        """The hall's background at pixel row y of gh: a soft top-to-bottom gradient."""
+        p = self.game.pal
+        return mix(p.bg, p.surface, y / max(1, gh - 1))
+
+    @staticmethod
+    def tier_rows(lay: Layout) -> dict[int, int]:
+        """Pixel row of the first visible rack row of every visible tier: where its crew
+        stands (right of the racks) and its trucks park."""
+        rows: dict[int, int] = {}
+        for b in lay.blocks[lay.start:lay.end]:
+            if b.kind == "rack" and b.tier not in rows:
+                rows[b.tier] = (b.line0 - lay.top_line) * 2 + 1
+        return rows
+
+    def hat_colour(self, level: int) -> RGB:
+        """The crew hat by training level: plain grey when just hired, then a hue per level
+        (blue, cyan, green, yellow, orange, red, pink at Lv10) so every step is visible."""
+        if level <= 0:
+            return mix(self.game.pal.fg, self.game.pal.bg, HAT_NEUTRAL_MIX)
+        r, g, b = colorsys.hls_to_rgb(((HAT_HUE0 - (level - 1) * HAT_HUE_STEP) % 360) / 360, 0.6, 0.95)
+        return (int(r * 255), int(g * 255), int(b * 255))
+
+    def crew_pixels(self, tier: int, level: int, frame: str, under: RGB) -> list[tuple[int, int, RGB]]:
+        """(x, y, colour) of one crew frame; every part keeps CREW_MIN_CONTRAST against the
+        backdrop. Cached per palette, tier, level, frame and backdrop colour."""
+        key = (self.game.pal_serial, self.game.read_only, tier, level, frame, under)
+        hit = self._crew_cache.get(key)
+        if hit is not None:
+            return hit
+        body = self.tier_colour(tier)
+        hat, skin = self.hat_colour(level), SKIN
+        if self.game.read_only:  # a decommissioned hall is grey: so are its people, hat and skin too
+            surface = self.game.pal.surface
+            hat, skin = (mix((int(lum(c) * 255),) * 3, surface, 0.55) for c in (hat, skin))  # type: ignore[arg-type]
+        legend = {"a": hat, "s": skin, "c": body, "d": mix(body, (0, 0, 0), 0.5)}
+        legend = {k: ensure_contrast(v, under, CREW_MIN_CONTRAST) for k, v in legend.items()}
+        px = [(x, y, legend[ch]) for y, row in enumerate(CREW_FRAMES[frame])
+              for x, ch in enumerate(row) if ch != "."]
+        if len(self._crew_cache) > 400:  # stale palettes and backdrops: start over
+            self._crew_cache.clear()
+        self._crew_cache[key] = px
+        return px
+
+    def draw_crew(self, grid: list[list[RGB]], lay: Layout, t: float, moving: bool) -> None:
+        """One person per hired specialist, right of its tier's first visible rack row. They
+        bob while the hall animates; an effect (pop-in, level-up, install) overrides that."""
+        game = self.game
+        if not lay.reserve:
+            return
+        gh = len(grid)
+        fx_of = {f.tier: f for f in game.fx if f.kind in ("appear", "train", "install")}
+        for tier, oy in self.tier_rows(lay).items():
+            level = game.staff[tier]
+            if level < 0:
+                continue
+            fx = fx_of.get(tier)
+            frame = f"idle{int(t / CREW_BOB_S + tier) & 1}" if moving else "idle0"
+            u = fx.progress(game.now) if fx else 0.0
+            if fx and fx.kind != "appear":
+                frame = "work"
+            oy += CREW_DY
+            under = self.backdrop(oy + CREW_H // 2, gh)
+            rows = CREW_H
+            if fx and fx.kind == "appear":
+                rows = min(CREW_H, math.ceil(CREW_H * ease_out(u / 0.6)))
+            glow = 0.0
+            if fx:  # a bright flash that dies away; the install flash blinks twice
+                glow = 0.8 * (1 - u) if fx.kind != "install" else 0.5 * abs(math.sin(u * math.pi * 2))
+            for x, y, colour in self.crew_pixels(tier, level, frame, under):
+                if y < CREW_H - rows:  # a pop-in builds up from the feet
+                    continue
+                if glow:
+                    colour = mix(colour, (255, 255, 255), glow)
+                if 0 <= oy + y < gh and lay.crew_x + x < len(grid[0]):
+                    grid[oy + y][lay.crew_x + x] = colour
+
+    def truck_pixels(self, tier: int, under: RGB, facing_left: bool) -> list[tuple[int, int, RGB]]:
+        """(x, y, colour) of the delivery truck in the tier colour, mirrored when it drives off."""
+        key = (self.game.pal_serial, tier, under, facing_left)
+        hit = self._crew_cache.get(key)
+        if hit is not None:
+            return hit
+        p, body = self.game.pal, self.tier_colour(tier)
+        legend = {"c": body, "h": mix(body, (255, 255, 255), 0.35), "k": mix(p.fg, p.bg, 0.4),
+                  "w": mix(body, (255, 255, 255), 0.6), "d": mix(body, (0, 0, 0), 0.5)}
+        legend = {k: ensure_contrast(v, under, CREW_MIN_CONTRAST) for k, v in legend.items()}
+        px: list[tuple[int, int, RGB]] = []
+        for y, row in enumerate(TRUCK):
+            row = row if facing_left else row[::-1]
+            px.extend((x, y, legend[ch]) for x, ch in enumerate(row) if ch != ".")
+        if len(self._crew_cache) > 400:  # stale palettes and backdrops: start over
+            self._crew_cache.clear()
+        self._crew_cache[key] = px
+        return px
+
+    @staticmethod
+    def truck_x(fx: Fx, now: float, start: float, stop: float) -> float | None:
+        """Left pixel column of a truck: eases in to `stop`, waits, then drives off back to
+        `start`. None once it is gone."""
+        age = now - fx.born
+        if age < fx.span:
+            return stop + (start - stop) * (1 - ease_out(age / fx.span))
+        if age < fx.span + TRUCK_PARK_S:
+            return stop
+        back = (age - fx.span - TRUCK_PARK_S) / fx.span
+        return stop + (start - stop) * smoothstep(back) if back < 1 else None
+
+    def draw_trucks(self, grid: list[list[RGB]], lay: Layout) -> None:
+        """Chip delivery trucks drive along their tier's first rack row to the crew spot (in
+        front of the racks, behind the crew)."""
+        game = self.game
+        rows, gh, gw = self.tier_rows(lay), len(grid), len(grid[0])
+        stop = max(0, lay.crew_x - 1 - TRUCK_W)
+        for fx in game.fx:
+            if fx.kind != "truck" or fx.tier not in rows:
+                continue
+            x = self.truck_x(fx, game.now, float(gw), float(stop))
+            if x is None:
+                continue
+            oy = rows[fx.tier] + 1
+            leaving = game.now - fx.born >= fx.span + TRUCK_PARK_S
+            under = self.backdrop(oy + TRUCK_H // 2, gh)
+            left = round(x)
+            for px, py, colour in self.truck_pixels(fx.tier, under, not leaving):
+                if 0 <= left + px < gw and 0 <= oy + py < gh:
+                    grid[oy + py][left + px] = colour
+
+    def draw_builds(self, grid: list[list[RGB]], lay: Layout) -> None:
+        """A new rack materialises column by column behind a bright scan edge: the columns
+        not yet built show the backdrop again."""
+        game = self.game
+        gh = len(grid)
+        for fx in game.fx:
+            if fx.kind != "build" or fx.slot >= game.owned[fx.tier]:
+                continue
+            at = lay.rack_xy(lay.tier_first[fx.tier] + fx.slot, fx.tier)
+            if at is None:
+                continue
+            ox, oy = at
+            built = int(fx.progress(game.now) * CELL_W)
+            for x in range(CELL_W - 1):
+                if x < built - 1:
+                    continue
+                for y in range(CELL_H - 1):  # sprite rows and the pip row below
+                    if x >= built:
+                        grid[oy + y][ox + x] = self.backdrop(oy + y, gh)
+                    else:  # the scan edge
+                        grid[oy + y][ox + x] = mix(grid[oy + y][ox + x], (255, 255, 255), 0.6)
 
     def tier_colour(self, tier: int) -> RGB:
         """A tier's colour in this hall: washed out to grey in a decommissioned one."""
@@ -1008,10 +1202,10 @@ class Hall(Widget):
         w, t = self.size.width, game.now
         slow = math.floor(t * SLOW_HZ) / SLOW_HZ  # LEDs and glow tick slower than the pulse
         lay = self.rack_layout()
-        gw, dead = lay.cols * CELL_W, game.read_only
+        gw, dead = lay.grid_w, game.read_only
         pulse = round(PULSE_STEPS * sine01(slow, TOP_PERIOD_S)) if animating else 0
-        key = (game.pal_serial, tuple(game.owned), tuple(game.chips), game.top_tier(), lay.start,
-               lay.end, lay.cols, lay.height, dead, animating, pulse)
+        key = (game.pal_serial, tuple(game.owned), tuple(game.shown_chip(i) for i in range(len(TIERS))),
+               game.top_tier(), lay.start, lay.end, lay.cols, lay.reserve, lay.height, dead, animating, pulse)
         if self._base_key != key:  # sprites only change when the layout, a chip or the pulse step does
             self._base_key = key
             self._base = self.base_grid(lay, pulse)
@@ -1031,6 +1225,9 @@ class Hall(Widget):
             if not game.crisis:  # data stops flowing while something is broken
                 self.draw_bus(grid, lay, t)
             self.draw_sparks(grid, lay)
+            self.draw_builds(grid, lay)
+            self.draw_trucks(grid, lay)
+        self.draw_crew(grid, lay, t, animating)
         cells: list[list[Cell]] = [[("▀", grid[y][x], grid[y + 1][x]) for x in range(gw)]
                                    for y in range(0, len(grid), 2)]
         scrolled = lay.scrolled
@@ -1423,6 +1620,8 @@ class DataCenter(App):
         self.phase = 0
         self.foreground = True
         self.fx: list[Fx] = []
+        self.chip_shown: dict[int, int] = {}  # tier -> chip level its pips still show (truck en route)
+        self.auto_fx_ok = True  # tick(): is the data center you are looking at the live one?
         self.fx_seq = 0  # numbers the effects: their look is a function of this and the phase
         self.now = clock()  # animation time, refreshed by every frame and redraw
         self.cash_flash = 0  # +1 balance just rose, -1 it just fell, 0 no flash
@@ -1613,6 +1812,7 @@ class DataCenter(App):
         self._hall_sig = None  # forget the cached hall picture: it holds the old colours
         hall = self.query_one(Hall)
         hall._rows, hall._base_key = None, None
+        hall._crew_cache.clear()
         hall._strips = {}
         self.redraw()
         self.save()
@@ -1623,6 +1823,7 @@ class DataCenter(App):
         if not self.is_running:  # the timer can fire while the app is shutting down
             return
         view = self.cur
+        self.auto_fx_ok = view == self.sites  # autopilot effects belong to the live hall only
         self.cur = self.sites  # the live data center keeps working while you look at an old one
         try:
             self.balance += self.income
@@ -1656,11 +1857,13 @@ class DataCenter(App):
                     break
                 self.balance -= cost
                 self.owned[t] += 1
+                self.server_arrived(t, auto=True)
             if level >= AUTO_CHIPS_LEVEL and self.owned[t] > 0 and self.chips[t] < MAX_CHIP:
                 cost = chip_cost(t, self.chips[t], self.cur)
                 if self.balance >= cost and cost <= cheap:
                     self.balance -= cost
                     self.chips[t] += 1
+                    self.chip_installed(t, self.chips[t] - 1, auto=True)
 
     def action_autopilot(self) -> None:
         self.autopilot = not self.autopilot
@@ -1694,6 +1897,82 @@ class DataCenter(App):
             self.add_fx("spark", SPARK_LIFE_S, tier=tier, big=big)
             self.sync_clock()
 
+    def shown_chip(self, tier: int) -> int:
+        """The chip level the hall's pips show: the real one, except while a truck is still
+        bringing the newest chips."""
+        return self.chip_shown.get(tier, self.chips[tier])
+
+    def pulse(self, kind: str, tier: int, life: float, born: float | None = None, **kw: Any) -> None:
+        """Start a crew effect for a tier, replacing the one it had (the clock is synced by
+        the caller)."""
+        self.fx_seq += 1
+        self.fx = [f for f in self.fx if not (f.tier == tier and f.kind in ("appear", "train", "install"))]
+        self.fx.append(Fx(kind, mix32(self.fx_seq, self.phase), life,
+                          self.now if born is None else born, tier=tier, **kw))
+
+    def crew_fx(self, kind: str, tier: int) -> None:
+        """A hire pops the new person in, training makes them flash (no sparkle at the racks)."""
+        if self.animating:
+            self.now = clock()
+            self.pulse(kind, tier, APPEAR_S if kind == "appear" else TRAIN_S)
+            self.sync_clock()
+
+    def server_arrived(self, tier: int, auto: bool) -> None:
+        """A bought server materialises in its rack slot; on autopilot its crew places it."""
+        if not self.animating or (auto and not self.auto_fx_ok):
+            return
+        if sum(f.kind == "build" for f in self.fx) >= MAX_BUILDS:
+            return
+        self.now = clock()
+        self.fx.append(Fx("build", mix32(self.fx_seq, tier, self.owned[tier]), BUILD_S, self.now,
+                          tier=tier, slot=self.owned[tier] - 1))
+        self.fx_seq += 1
+        if auto and self.staff[tier] >= 0:
+            self.pulse("install", tier, INSTALL_S)
+        self.sync_clock()
+
+    def chip_installed(self, tier: int, before: int, auto: bool) -> None:
+        """Chips just bought for `tier` (real level already raised; `before` is the old one). A
+        manual purchase sends a truck: the pips keep the old level until it arrives and the crew
+        installs. Autopilot just shows the install; no animation shows the pips at once."""
+        if not self.animating or (auto and not self.auto_fx_ok):
+            return
+        self.now = clock()
+        if auto or not self.send_truck(tier, before):
+            if self.staff[tier] >= 0:
+                self.pulse("install", tier, INSTALL_S)
+        self.sync_clock()
+
+    def send_truck(self, tier: int, before: int) -> bool:
+        """Start a delivery for a tier unless it is not worth one: that tier's chips are already
+        on the way (they ride along), two trucks are driving, or its rack rows are scrolled out
+        of view. True when the chips are covered (the pips lag until the truck lands)."""
+        if any(f.kind == "truck" and f.tier == tier and not f.arrived for f in self.fx):
+            return True  # coalesced: the same truck brings every chip bought meanwhile
+        if sum(f.kind == "truck" for f in self.fx) >= MAX_TRUCKS:
+            return False
+        hall = self.query_one(Hall)
+        lay = hall.rack_layout()
+        if tier not in hall.tier_rows(lay):
+            return False
+        stop = max(0, lay.crew_x - 1 - TRUCK_W)
+        span = min(TRUCK_MAX_S, max(TRUCK_MIN_S, (lay.grid_w - stop) / TRUCK_PX_S))
+        self.chip_shown.setdefault(tier, before)
+        self.fx_seq += 1
+        self.fx.append(Fx("truck", mix32(self.fx_seq, tier), 2 * span + TRUCK_PARK_S, self.now,
+                          tier=tier, span=span))
+        return True
+
+    def land_trucks(self) -> None:
+        """A truck that has stopped installs its chips: the pips show the real level and the
+        crew does its install pulse, timed from the moment the truck stopped."""
+        for fx in [f for f in self.fx if f.kind == "truck" and not f.arrived
+                   and self.now - f.born >= f.span]:
+            fx.arrived = True
+            self.chip_shown.pop(fx.tier, None)
+            if self.staff[fx.tier] >= 0:
+                self.pulse("install", fx.tier, INSTALL_S, born=fx.born + fx.span)
+
     def anim_tick(self) -> None:
         """Once a second: make sure the frame clock matches whether we are in front (this
         reads self.foreground, which tick() cached: frames never ask tmux)."""
@@ -1706,6 +1985,7 @@ class DataCenter(App):
 
     def expire_fx(self) -> None:
         """Drop every effect whose time is up (compares against self.now)."""
+        self.land_trucks()  # first: a frame that skipped a whole delivery still lands it
         self.fx = [fx for fx in self.fx if self.now - fx.born < fx.life]
         if self.cash_flash and self.now - self.cash_t0 >= CASH_FLASH_S:
             self.cash_flash = 0
@@ -1748,6 +2028,7 @@ class DataCenter(App):
     def clear_fx(self) -> None:
         """Drop every effect (background pane, old data center, animation off)."""
         self.fx.clear()
+        self.chip_shown.clear()  # no truck is coming any more: the pips tell the truth
         self.cash_flash = 0
         self.resolve_t0 = None
         self.reloc = None
@@ -2116,6 +2397,7 @@ class DataCenter(App):
             self.balance -= cost
             self.owned[tier] += 1
             self.sparkle(tier, milestone_mult(self.owned[tier]) > before)
+            self.server_arrived(tier, auto=False)
             self.say(f"+ {TIERS[tier][0]}  -${fmt(cost)}", p.success)
         else:
             self.say(f"! need ${fmt(cost)} for {TIERS[tier][0]}", p.error)
@@ -2137,7 +2419,7 @@ class DataCenter(App):
         else:
             self.balance -= cost
             self.chips[tier] += 1
-            self.sparkle(tier)
+            self.chip_installed(tier, level, auto=False)
             self.say(f"+ {chip_name(tier, level)}: {TIERS[tier][0]} income x{CHIP_BOOST}",
                      p.success)
 
@@ -2155,7 +2437,7 @@ class DataCenter(App):
             return
         self.balance -= cost
         self.staff[role] += 1
-        self.sparkle(role)
+        self.crew_fx("appear" if level < 0 else "train", role)
         if level < 0:
             self.say(f"+ Hired a {name}: {tagline} (runs {TIERS[role][0]})", p.success)
         else:
@@ -2196,6 +2478,7 @@ class DataCenter(App):
                 self.say(f"★ Promoted: {after}!", p.warning)
             if self.animating:
                 self.fx.clear()
+                self.chip_shown.clear()
                 self.now = clock()
                 self.reloc = {"t0": self.now, "gain": gain,
                               "rank": after if after != before else None}
@@ -2271,7 +2554,7 @@ class DataCenter(App):
         anim = self.animating
         moving = anim and bool(sum(self.owned) or self.fx or self.reloc)
         sig = (self.cur, self.sites, tuple(self.owned), self.crisis is not None, self.pal_serial,
-               tuple(self.chips), self.hall_scroll, self.query_one(Hall).size, int(self.now * ANIM_FPS) if moving else 0, anim,
+               tuple(self.chips), tuple(self.staff), tuple(sorted(self.chip_shown.items())), self.hall_scroll, self.query_one(Hall).size, int(self.now * ANIM_FPS) if moving else 0, anim,
                tuple((f.kind, f.seed) for f in self.fx), self.reloc is not None)
         if sig != self._hall_sig:  # a static hall costs nothing to leave alone
             self._hall_sig = sig

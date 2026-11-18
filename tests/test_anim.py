@@ -988,7 +988,7 @@ class NoFloats(AnimCase):
                 app.tick()
             self.assertEqual(app.fx, [])  # earning money launches nothing
             await pilot.press("1")
-            self.assertEqual([f.kind for f in app.fx], ["spark"])
+            self.assertEqual([f.kind for f in app.fx], ["spark", "build"])  # a server arrives
             self.assertNotEqual(app.cash_flash, 0)
             for i in range(6):
                 self.assertNotIn("+$", hall_frame(app, self.t + i * 0.2).plain)
@@ -1365,13 +1365,14 @@ class PipVisibility(AnimCase):
 
 class NoOrphanHeaders(AnimCase):
     @staticmethod
-    def layout(owned: list[int], w: int, h: int, scroll: int | None) -> game.Layout:
+    def layout(owned: list[int], w: int, h: int, scroll: int | None, hired: bool = False) -> game.Layout:
         from textual.geometry import Size
 
         class Fake:
             pass
         fake = Fake()
         fake.owned, fake.hall_scroll = list(owned), scroll  # type: ignore[attr-defined]
+        fake.staff = [3] * len(owned) if hired else [-1] * len(owned)  # type: ignore[attr-defined]
 
         class H(game.Hall):
             game = property(lambda self: fake)  # type: ignore[assignment]
@@ -1437,3 +1438,484 @@ class NoOrphanHeaders(AnimCase):
             await pilot.press("end")
             self.assertIsNone(app.hall_scroll)
             self.assertEqual(hall.rack_layout().end, len(hall.rack_layout().blocks))
+
+
+# ---------------------------------------------------------------- crew, deliveries, arrivals
+
+CREWED = [8, 6, 4, 2, 1] + [0] * (N - 5)
+HIRED = [3, 0, -1, 10, -1] + [-1] * (N - 5)  # tiers 0, 1 and 3 have a specialist
+
+
+def crew_save(**extra: object) -> dict[str, object]:
+    base: dict[str, object] = {"site_balance": [10**18], "site_owned": [list(CREWED)],
+                               "site_staff": [list(HIRED)]}
+    base.update(extra)
+    return live_save(**base)
+
+
+def pixel(app: object, x: int, y: int) -> game.RGB:
+    """Pixel (x, y) of the hall picture as build_cells() draws it."""
+    cell = app.query_one(game.Hall).build_cells()[y // 2][x]  # type: ignore[attr-defined]
+    return cell[1] if y % 2 == 0 else cell[2]  # type: ignore[return-value]
+
+
+def crew_px(app: object, tier: int) -> list[game.RGB]:
+    """The 5x6 pixels where `tier`'s crew member stands (the whole picture is the hall)."""
+    hall = app.query_one(game.Hall)  # type: ignore[attr-defined]
+    lay = hall.rack_layout()
+    oy = hall.tier_rows(lay)[tier] + game.CREW_DY
+    cells = hall.build_cells()
+    out = []
+    for y in range(game.CREW_H):
+        for x in range(game.CREW_W):
+            c = cells[(oy + y) // 2][lay.crew_x + x]
+            out.append(c[1] if (oy + y) % 2 == 0 else c[2])
+    return out
+
+
+def backdrop_px(app: object, tier: int) -> list[game.RGB]:
+    hall = app.query_one(game.Hall)  # type: ignore[attr-defined]
+    lay = hall.rack_layout()
+    oy = hall.tier_rows(lay)[tier] + game.CREW_DY
+    gh = lay.used * 2
+    return [hall.backdrop(oy + y, gh) for y in range(game.CREW_H) for _ in range(game.CREW_W)]
+
+
+class Crew(AnimCase):
+    async def test_a_crew_sprite_exists_exactly_for_hired_specialists(self) -> None:
+        async with self.run_app(crew_save(), size=(120, 50)) as (app, pilot):
+            app.redraw()
+            for tier in range(5):
+                shown = crew_px(app, tier) != backdrop_px(app, tier)
+                self.assertEqual(shown, app.staff[tier] >= 0, tier)
+            self.assertEqual(app.query_one(game.Hall).rack_layout().reserve, game.CREW_MARGIN)
+
+    async def test_no_margin_and_no_sprite_without_a_crew(self) -> None:
+        async with self.run_app(live_save(), size=(120, 50)) as (app, pilot):
+            lay = app.query_one(game.Hall).rack_layout()
+            self.assertEqual((lay.reserve, lay.grid_w), (0, lay.cols * game.CELL_W))
+            await pilot.press("h")
+            app.balance = 10**9
+            app.hire_staff(0)
+            lay = app.query_one(game.Hall).rack_layout()
+            self.assertEqual(lay.reserve, game.CREW_MARGIN)
+
+    async def test_hat_colour_follows_the_training_level(self) -> None:
+        async with self.run_app(crew_save(), size=(120, 50)) as (app, pilot):
+            for theme in ("gruvbox", "atom-one-light"):
+                app.theme = theme
+                await pilot.pause()
+                app._pal = None
+                hall = app.query_one(game.Hall)
+                hats = []
+                for level in range(game.MAX_STAFF + 1):
+                    app.staff[0] = level
+                    hat = crew_px(app, 0)[1]  # top row, middle: the hat
+                    hats.append(hat)
+                    self.assertGreaterEqual(game.contrast(hat, hall.backdrop(5, 20)), 2.9, (theme, level))
+                self.assertEqual(len(set(hats)), game.MAX_STAFF + 1, theme)
+                for a, b in zip(hats, hats[1:]):  # every step is a visible change
+                    self.assertGreater(max(abs(x - y) for x, y in zip(a, b)), 25, (theme, a, b))
+
+    async def test_hire_pops_in_and_train_flashes_without_sparkles(self) -> None:
+        async with self.run_app(crew_save()) as (app, pilot):
+            app.fx.clear()
+            app.balance = 10**15
+            app.staff[2] = -1
+            app.hire_staff(2)
+            self.assertEqual([f.kind for f in app.fx], ["appear"])  # no spark at the newest rack
+            fx = app.fx[0]
+            self.assertEqual(app.staff[2], 0)
+            app.now = fx.born + 0.05
+            early = crew_px(app, 2)
+            self.assertEqual(early[1], backdrop_px(app, 2)[1])  # the hat is not there yet: it builds from the feet
+            app.now = fx.born + game.APPEAR_S + 0.01
+            late = crew_px(app, 2)
+            self.assertNotEqual(late[1], backdrop_px(app, 2)[1])
+            self.frame(app, game.APPEAR_S + 0.01)
+            self.assertEqual([f for f in app.fx if f.kind == "appear"], [])
+            app.hire_staff(2)  # training: a flash, still no spark
+            self.assertEqual([f.kind for f in app.fx], ["train"])
+            app.now = app.fx[0].born
+            flash = crew_px(app, 2)
+            app.now = app.fx[0].born + game.TRAIN_S
+            calm = crew_px(app, 2)
+            self.assertGreater(sum(map(sum, flash)), sum(map(sum, calm)))  # whiter at first
+
+    async def test_idle_bob_only_moves_the_body_rows_and_is_cheap(self) -> None:
+        async with self.run_app(crew_save(), size=(120, 50)) as (app, pilot):
+            hall = app.query_one(game.Hall)
+            lay = hall.rack_layout()
+            frames = []
+            for k in range(2):
+                app.now = self.t + k * game.CREW_BOB_S
+                frames.append(hall.build_cells())
+            changed = {(y, x) for y, (a, b) in enumerate(zip(*frames)) for x, (ca, cb) in enumerate(zip(a, b))
+                       if ca != cb and x >= lay.crew_x}
+            self.assertTrue(changed)
+            for tier, oy in hall.tier_rows(lay).items():
+                if app.staff[tier] >= 0:  # only the body text line of each person moves
+                    top = oy + game.CREW_DY
+                    mine = {(y, x) for y, x in changed if top // 2 <= y <= (top + 5) // 2}
+                    self.assertEqual({y for y, _ in mine}, {(top + 2) // 2})
+                    self.assertLessEqual(len(mine), game.CREW_W)
+            app.now = self.t
+            a = [r[lay.crew_x:] for r in hall.build_cells()]
+            app.now = self.t + game.CREW_BOB_S / 2  # inside the same half-second: identical people
+            self.assertEqual(a, [r[lay.crew_x:] for r in hall.build_cells()])
+
+    async def test_crew_is_still_when_anim_is_off_or_the_world_is_old(self) -> None:
+        game.ANIM = False
+        async with self.run_app(crew_save(), size=(120, 50)) as (app, pilot):
+            hall = app.query_one(game.Hall)
+            a = hall.build_cells()
+            app.now = self.t + 0.5
+            self.assertEqual(a, hall.build_cells())
+            self.assertIsNone(app._anim_timer)
+            self.assertNotEqual(crew_px(app, 0), backdrop_px(app, 0))  # but they are there
+            app.hire_staff(2)
+            self.assertEqual(app.fx, [])
+        game.ANIM = True
+        n = len(game.TIERS)
+        async with self.run_app(world_save(site_staff=[[7] * n, [-1] * n, [-1] * n], cur=0), size=(120, 60)) as (app, pilot):
+            self.assertTrue(app.read_only)
+            hall = app.query_one(game.Hall)
+            a = hall.build_cells()
+            app.now = self.t + 0.5
+            self.assertEqual(a, hall.build_cells())  # washed out and motionless
+            px = crew_px(app, 0)
+            self.assertNotEqual(px, backdrop_px(app, 0))
+            for r, g, b in px:
+                self.assertLess(max(abs(r - g), abs(g - b)), 12)  # grey: hat and skin are washed out too
+
+
+class Delivery(AnimCase):
+    async def test_manual_chip_sends_a_truck_and_the_pips_lag_until_it_stops(self) -> None:
+        async with self.run_app(crew_save(), size=(120, 50)) as (app, pilot):
+            app.fx.clear()
+            hall = app.query_one(game.Hall)
+            app.balance = 10**15
+            app.buy_chip(1)
+            self.assertEqual(app.chips[1], 1)  # the state changed at once
+            self.assertEqual([f.kind for f in app.fx], ["truck"])  # and no sparkle at a rack
+            self.assertEqual(app.shown_chip(1), 0)
+            truck = app.fx[0]
+            lay = hall.rack_layout()
+            self.assertEqual(pip_pixels(app, lay.tier_first[1], 1), [app.pal.pip_floor] * 5)
+            self.frame(app, truck.span - 0.01)
+            self.assertEqual(app.shown_chip(1), 0)  # still on the road
+            self.frame(app, 0.02)
+            self.assertEqual(app.shown_chip(1), 1)
+            self.assertNotEqual(pip_pixels(app, lay.tier_first[1], 1)[0], app.pal.pip_floor)
+            self.assertEqual([f.kind for f in app.fx if f.kind == "install"], ["install"])  # the crew installs
+            self.frame(app, game.TRUCK_PARK_S + truck.span + 0.1)
+            self.assertEqual(app.fx, [])
+            self.assertEqual(app.chip_shown, {})
+
+    async def test_truck_path_timing(self) -> None:
+        async with self.run_app(crew_save(), size=(120, 50)) as (app, pilot):
+            app.fx.clear()
+            app.buy_chip(0)
+            fx, lay = app.fx[0], app.query_one(game.Hall).rack_layout()
+            start, stop = float(lay.grid_w), float(lay.crew_x - 1 - game.TRUCK_W)
+            at = lambda dt: game.Hall.truck_x(fx, fx.born + dt, start, stop)  # noqa: E731
+            self.assertAlmostEqual(at(0), start)
+            self.assertAlmostEqual(at(fx.span), stop)
+            self.assertAlmostEqual(at(fx.span + game.TRUCK_PARK_S / 2), stop)  # it stops for ~0.3 s
+            xs = [at(fx.span * i / 10) for i in range(11)]
+            self.assertTrue(all(a >= b for a, b in zip(xs, xs[1:])))  # drives in, never back
+            self.assertIsNone(at(fx.life + 0.01))
+            ex = [at(fx.span + game.TRUCK_PARK_S + fx.span * i / 10) for i in range(10)]
+            self.assertTrue(all(a <= b for a, b in zip(ex, ex[1:])))  # then leaves the other way
+            self.assertAlmostEqual(fx.life, 2 * fx.span + game.TRUCK_PARK_S)
+            self.assertGreaterEqual(fx.span, game.TRUCK_MIN_S)
+            self.assertLessEqual(fx.span, game.TRUCK_MAX_S)
+
+    async def test_truck_is_drawn_in_the_tier_colour_in_its_row(self) -> None:
+        async with self.run_app(crew_save(), size=(120, 50)) as (app, pilot):
+            hall = app.query_one(game.Hall)
+            app.fx.clear()
+            app.buy_chip(1)
+            fx, lay = app.fx[0], hall.rack_layout()
+            oy = hall.tier_rows(lay)[1]
+            app.now = fx.born + fx.span  # parked
+            stop = lay.crew_x - 1 - game.TRUCK_W
+            cargo = pixel(app, stop + 5, oy + 1 + 1)
+            want = {(x, y): c for x, y, c in hall.truck_pixels(1, hall.backdrop(oy + 3, lay.used * 2), True)}
+            self.assertEqual(cargo, want[(5, 1)])
+            self.assertGreaterEqual(game.contrast(cargo, hall.backdrop(oy + 3, lay.used * 2)), 2.99)
+
+    async def test_trucks_are_capped_and_repeats_ride_along(self) -> None:
+        async with self.run_app(crew_save(), size=(120, 50)) as (app, pilot):
+            app.fx.clear()
+            app.balance = 10**18
+            app.buy_chip(0)
+            app.buy_chip(0)  # same tier: the same truck brings both
+            self.assertEqual(sum(f.kind == "truck" for f in app.fx), 1)
+            self.assertEqual((app.chips[0], app.shown_chip(0)), (2, 0))
+            app.buy_chip(1)
+            app.buy_chip(3)  # a third tier while two trucks drive: no truck, pips at once
+            self.assertEqual(sum(f.kind == "truck" for f in app.fx), game.MAX_TRUCKS)
+            self.assertEqual((app.chips[3], app.shown_chip(3)), (1, 1))
+            self.frame(app, 5.0)
+            self.assertEqual((app.shown_chip(0), app.shown_chip(1)), (2, 1))  # one landing shows the final level
+
+    async def test_no_truck_when_the_tier_is_scrolled_out_of_view(self) -> None:
+        owned = [30, 20, 12, 9, 5] + [0] * (N - 5)
+        async with self.run_app(crew_save(site_owned=[owned]), size=(80, 24)) as (app, pilot):
+            app.fx.clear()
+            await pilot.press("end")
+            self.assertNotIn(0, app.query_one(game.Hall).tier_rows(app.query_one(game.Hall).rack_layout()))
+            app.buy_chip(0)
+            self.assertEqual([f for f in app.fx if f.kind == "truck"], [])
+            self.assertEqual((app.chips[0], app.shown_chip(0)), (1, 1))
+
+    async def test_autopilot_chips_install_without_a_truck(self) -> None:
+        save = crew_save(autopilot=True, site_staff=[[game.AUTO_CHIPS_LEVEL] * N], site_balance=[10**18],
+                         site_chips=[[0] * N])
+        async with self.run_app(save, size=(120, 50)) as (app, pilot):
+            app.fx.clear()
+            app.run_autopilot()
+            self.assertGreater(app.chips[0], 0)
+            kinds = {f.kind for f in app.fx}
+            self.assertIn("install", kinds)
+            self.assertNotIn("truck", kinds)
+            self.assertNotIn("spark", kinds)
+            self.assertEqual(app.chip_shown, {})  # the pips follow at once
+
+    async def test_no_truck_in_background_old_world_or_with_anim_off(self) -> None:
+        async with self.run_app(crew_save(), size=(120, 50)) as (app, pilot):
+            app.foreground = False
+            app.balance = 10**18
+            app.buy_chip(0)
+            self.assertEqual((app.fx, app.chip_shown), ([], {}))
+            app.foreground = True
+            app.fx.clear()
+            app.buy_chip(0)
+            self.assertEqual(len(app.fx), 1)
+            app.foreground = False  # the pane goes to the back mid-delivery: the pips tell the truth
+            app.anim_tick()
+            self.assertEqual((app.fx, app.chip_shown), ([], {}))
+        game.ANIM = False
+        async with self.run_app(crew_save(), size=(120, 50)) as (app, pilot):
+            app.buy_chip(0)
+            self.assertEqual((app.fx, app.chip_shown, app.chips[0]), ([], {}, 1))
+        game.ANIM = True
+        async with self.run_app(world_save(cur=0)) as (app, pilot):
+            before = list(app.chips)
+            app.buy_chip(0)  # read only: nothing is bought and nothing drives
+            self.assertEqual((app.fx, app.chip_shown, app.chips), ([], {}, before))
+
+
+class Arrivals(AnimCase):
+    async def test_server_purchase_sparkles_and_builds_in_but_chip_and_hire_do_not_sparkle(self) -> None:
+        async with self.run_app(crew_save(), size=(120, 50)) as (app, pilot):
+            app.fx.clear()
+            app.balance = 10**18
+            app.action_buy(1)
+            self.assertEqual(sorted(f.kind for f in app.fx), ["build", "spark"])
+            app.fx.clear()
+            app.buy_chip(1)
+            app.hire_staff(1)
+            self.assertEqual(sorted(f.kind for f in app.fx), ["train", "truck"])
+            self.assertNotIn("spark", {f.kind for f in app.fx})
+
+    async def test_build_in_reveals_the_rack_column_by_column_then_expires(self) -> None:
+        async with self.run_app(crew_save(), size=(120, 50)) as (app, pilot):
+            app.fx.clear()
+            app.balance = 10**18
+            app.action_buy(1)
+            fx = next(f for f in app.fx if f.kind == "build")
+            hall, owned = app.query_one(game.Hall), app.owned[1]
+            lay = hall.rack_layout()
+            ox, oy = lay.rack_xy(lay.tier_first[1] + owned - 1, 1)  # type: ignore[misc]
+            self.assertEqual(fx.slot, owned - 1)
+            gh, shown = lay.used * 2, []
+            for i in range(game.CELL_W + 1):
+                app.now = fx.born + game.BUILD_S * i / game.CELL_W * 0.999
+                cols = [sum(pixel(app, ox + x, oy + y) != hall.backdrop(oy + y, gh) for y in range(6))
+                        for x in range(6)]
+                shown.append(sum(1 for c in cols if c))
+            self.assertEqual(shown[0], 0)
+            self.assertTrue(all(a <= b for a, b in zip(shown, shown[1:])))  # grows left to right
+            self.assertEqual(shown[-1], 6)
+            self.frame(app, game.BUILD_S + 0.01)
+            self.assertEqual([f for f in app.fx if f.kind == "build"], [])
+
+    async def test_autopilot_servers_build_in_and_their_crew_places_them(self) -> None:
+        save = crew_save(autopilot=True, site_staff=[[game.AUTO_SERVERS_LEVEL] * N], site_balance=[10**18])
+        async with self.run_app(save, size=(120, 50)) as (app, pilot):
+            app.fx.clear()
+            before = sum(app.owned)
+            app.run_autopilot()
+            self.assertGreater(sum(app.owned), before)
+            kinds = [f.kind for f in app.fx]
+            self.assertIn("build", kinds)
+            self.assertIn("install", kinds)
+            self.assertNotIn("spark", kinds)
+            self.assertLessEqual(kinds.count("build"), game.MAX_BUILDS)
+
+    async def test_effects_only_when_you_are_looking_at_the_live_hall(self) -> None:
+        save = world_save(autopilot=True, site_staff=[[-1] * N, [-1] * N, [game.AUTO_CHIPS_LEVEL] * N], cur=1)
+        async with self.run_app(save) as (app, pilot):
+            app.site_balance[2] = 10**24
+            app.tick()  # you are in an old data center while the live one earns and buys
+            self.assertEqual(app.fx, [])
+            self.assertEqual(app.chip_shown, {})
+
+
+class Untouched(AnimCase):
+    @staticmethod
+    def script(app: object) -> list[object]:
+        app.balance = 10**15  # type: ignore[attr-defined]
+        out: list[object] = []
+        for step in range(40):
+            if step % 3 == 0:
+                app.action_buy(step % 5)  # type: ignore[attr-defined]
+            if step % 5 == 0:
+                app.buy_chip(step % 4)  # type: ignore[attr-defined]
+            if step % 7 == 0:
+                app.hire_staff(step % 3)  # type: ignore[attr-defined]
+            if step == 20:
+                app.autopilot = True  # type: ignore[attr-defined]
+            app.run_autopilot()  # type: ignore[attr-defined]
+            out.append((app.balance, list(app.owned), list(app.chips), list(app.staff)))  # type: ignore[attr-defined]
+        return out
+
+    async def test_game_state_is_identical_with_and_without_animation(self) -> None:
+        logs = []
+        for anim in (True, False):
+            game.ANIM = anim
+            async with self.run_app(crew_save(site_staff=[[-1] * N], site_balance=[10**15])) as (app, pilot):
+                logs.append(self.script(app))
+        self.assertEqual(logs[0], logs[1])
+        self.assertGreater(logs[0][-1][2][0], 0)
+
+
+class CrewPaint(AnimCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.term = install_term(self)
+        orig = game.DataCenter.tick
+        game.DataCenter.tick = lambda self: None  # type: ignore[method-assign]
+        self.addCleanup(lambda: setattr(game.DataCenter, "tick", orig))
+        self.check = Paint.check.__get__(self)
+
+    async def test_cache_term_and_full_render_agree_through_every_effect(self) -> None:
+        async with self.run_app(crew_save(), size=(110, 40)) as (app, pilot):
+            await self.check(app, pilot, "idle with crew")
+            app.balance = 10**18
+            app.buy_chip(0)
+            app.buy_chip(1)
+            app.action_buy(1)
+            app.hire_staff(2)
+            for i in range(30):
+                self.frame(app, 0.1)
+                await self.check(app, pilot, f"frame {i}")
+            self.assertEqual(app.fx, [])
+            for size in ((80, 24), (150, 50)):
+                await pilot.resize_terminal(*size)
+                await pilot.pause(0.2)
+                await self.check(app, pilot, f"resize {size}")
+            for key in ("home", "pagedown", "down", "end"):
+                await pilot.press(key)
+                await self.check(app, pilot, key)
+
+    async def test_old_world_with_crew(self) -> None:
+        n = len(game.TIERS)
+        async with self.run_app(world_save(site_staff=[[2] * n, [-1] * n, [-1] * n])) as (app, pilot):
+            await pilot.press("left_square_bracket")
+            await self.check(app, pilot, "old world with crew")
+
+    async def test_a_frame_with_a_truck_changes_few_cells(self) -> None:
+        async with self.run_app(crew_save(), size=(120, 50)) as (app, pilot):
+            hall = app.query_one(game.Hall)
+            app.balance = 10**18
+            app.buy_chip(1)
+            self.frame(app, 0.3)
+            a = hall.build_cells()
+            self.frame(app, 1 / 12)
+            b = hall.build_cells()
+            diff = sum(ca != cb for ra, rb in zip(a, b) for ca, cb in zip(ra, rb))
+            self.assertLess(diff, 130)  # measured ~100: a 9x5 truck is ~27 cells plus its trail
+
+
+class CrewLayout(AnimCase):
+    async def test_80x24_keeps_racks_headers_and_crew_apart(self) -> None:
+        owned = [30, 20, 12, 9, 5, 3, 1, 0, 0, 0]
+        staff = [3, 1, 0, 5, 10, 2, 0, -1, -1, -1]
+        async with self.run_app(crew_save(site_owned=[owned], site_staff=[staff]), size=(80, 24)) as (app, pilot):
+            hall = app.query_one(game.Hall)
+            seen: set[int] = set()
+            await pilot.press("home")
+            for _ in range(60):
+                lay = hall.rack_layout()
+                self.assertEqual(lay.reserve, game.CREW_MARGIN)
+                self.assertLessEqual(lay.grid_w, hall.size.width - (1 if lay.scrolled else 0))
+                self.assertNotEqual(lay.blocks[lay.end - 1].kind, "head")  # never orphans a header
+                cells = hall.build_cells()
+                for b in lay.blocks[lay.start:lay.end]:  # racks never reach into the crew margin
+                    if b.kind == "rack":
+                        self.assertLessEqual(b.count * game.CELL_W, lay.crew_x)
+                self.assertTrue(all(len(r) >= lay.grid_w for r in cells[:lay.used]))
+                for tier, oy in hall.tier_rows(lay).items():
+                    if staff[tier] >= 0:
+                        self.assertNotEqual(crew_px(app, tier), backdrop_px(app, tier))
+                seen.update(range(lay.start, lay.end))
+                await pilot.press("down")
+            self.assertEqual(len(seen), len(hall.rack_layout().blocks))  # every block is still reachable
+
+    async def test_a_hall_too_narrow_for_a_rack_and_a_person_keeps_its_racks(self) -> None:
+        async with self.run_app(crew_save(), size=(56, 24)) as (app, pilot):
+            lay = app.query_one(game.Hall).rack_layout()
+            self.assertGreaterEqual(lay.cols, 1)
+            self.assertEqual(lay.reserve, 0 if app.query_one(game.Hall).size.width - game.CREW_MARGIN < game.CELL_W
+                             else game.CREW_MARGIN)
+            app.query_one(game.Hall).build_cells()  # and it still draws
+
+    async def test_crew_and_truck_parts_keep_contrast_on_every_theme(self) -> None:
+        async with self.run_app(crew_save(), size=(120, 50)) as (app, pilot):
+            for name in sorted(app.available_themes):
+                app.theme = name
+                await pilot.pause()
+                app._pal = None
+                hall = app.query_one(game.Hall)
+                hall._crew_cache.clear()
+                lay = hall.rack_layout()
+                gh = lay.used * 2
+                for tier in (0, 1, 3):
+                    oy = hall.tier_rows(lay)[tier]
+                    under = hall.backdrop(oy + 3, gh)
+                    for level in (0, 1, 5, 10):
+                        for frame in game.CREW_FRAMES:
+                            for _, _, colour in hall.crew_pixels(tier, level, frame, under):
+                                self.assertGreaterEqual(game.contrast(colour, under), 2.99, (name, tier, level))
+                    for left in (True, False):
+                        for _, _, colour in hall.truck_pixels(tier, under, left):
+                            self.assertGreaterEqual(game.contrast(colour, under), 2.99, (name, tier))
+
+
+class CrewWidthSweep(AnimCase):
+    def layout(self, w: int, h: int, scroll: int | None, hired: bool) -> game.Layout:
+        return NoOrphanHeaders.layout([30, 20, 12, 9, 5, 3, 1, 0, 0, 0], w, h, scroll, hired)
+
+    def test_the_reported_width_13_scrolled_drops_the_margin(self) -> None:
+        lay = self.layout(13, 6, None, True)
+        self.assertTrue(lay.scrolled)
+        self.assertEqual((lay.reserve, lay.cols), (0, 1))
+
+    def test_no_row_wider_than_the_hall_and_no_orphan_header_for_widths_8_to_80(self) -> None:
+        for w in range(8, 81):
+            for h in (6, 9, 15):
+                n = len(self.layout(w, h, None, True).blocks)
+                for scroll in [None, 0, 1, 2, n // 2, n - 1]:
+                    for hired in (True, False):
+                        lay = self.layout(w, h, scroll, hired)
+                        bar = 1 if lay.scrolled else 0
+                        label = (w, h, scroll, hired)
+                        if lay.cols * game.CELL_W + bar <= w:  # a rack always fits when the hall is wide enough
+                            self.assertLessEqual(lay.grid_w + bar, w, label)
+                        if lay.reserve:  # a margin is only kept when rack + margin + scrollbar fit
+                            self.assertLessEqual(lay.grid_w + bar, w, label)
+                        self.assertEqual(lay.reserve > 0, hired and w - game.CREW_MARGIN - bar >= game.CELL_W, label)
+                        self.assertNotEqual(lay.blocks[lay.end - 1].kind, "head", label)

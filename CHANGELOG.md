@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Hiring and chips no longer look like a new server: no sparkle at the newest rack any more (a bought server still gets one, plus a short column-by-column build-in). Every hired specialist is drawn as a small person right of their tier's racks (hat colour = training level, idle bob, pop-in on hire, flash on training); a manual chip purchase sends a delivery truck that the crew meets before the chip pips fill in. Visuals only: game state and economy are unchanged, and it all follows `--no-anim`, background panes and decommissioned data centers. The hall reserves a 6 column right margin for the crew only when a hired specialist's tier also has racks (and the hall is wide enough), so an 80x24 terminal then shows one rack column fewer
 - The floating `+$X` money numbers are gone (they overlapped the servers); the balance flash and sparkles stay
 - Chip level at a glance: five small pips under every rack show the tier's chip level (one pip per chip family, four editions each, brighter with each edition; dark = no chip, all bright = level 20), and the Chip Upgrades card shows the same as small bars. They are static, so they cost no extra terminal output
 - Hall navigation: every tier has its own header line (`2 COMPUTE NODE x9 · chip L3/20`, tier colour, the key that buys it) that scrolls with the racks, the hall title shows `rows 12-24 of 40` and the border shows `▲ more` / `▼ more`. Up/down now move one header or rack row at a time. Tiers start on their own row, so small terminals scroll a little sooner than before
