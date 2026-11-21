@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## 0.2.0 - 2026-11-21
+
+- Renamed: the PyPI package is now `build-a-hyperscaler`, the command is `build-a-hyperscaler` and the Python import package is `build_a_hyperscaler` (`python -m build_a_hyperscaler`). `python -m data_center_tui` and `import data_center_tui` no longer exist. The in-game title ("My Data Center"), the GitHub repository and the leaderboard are unchanged
+- Upgrading: the old PyPI package `data-center-tui` stays at 0.1.0 except for a `0.2.0` stub that contains no code, depends on `build-a-hyperscaler` and provides the `data-center-tui` command. So `pip install -U data-center-tui` replaces the old package cleanly and installs the new one (the old and new packages share no files, so installing or uninstalling either does not break the other). The stub is not updated after this
+- New npm launcher `build-a-hyperscaler` (`npx build-a-hyperscaler`) that runs the game through `uvx`, `pipx` or an installed copy
 - Hiring and chips no longer look like a new server: no sparkle at the newest rack any more (a bought server still gets one, plus a short column-by-column build-in). Every hired specialist is drawn as a small person right of their tier's racks (hat colour = training level, idle bob, pop-in on hire, flash on training); a manual chip purchase sends a delivery truck that the crew meets before the chip pips fill in. Visuals only: game state and economy are unchanged, and it all follows `--no-anim`, background panes and decommissioned data centers. The hall reserves a 6 column right margin for the crew only when a hired specialist's tier also has racks (and the hall is wide enough), so an 80x24 terminal then shows one rack column fewer
 - The floating `+$X` money numbers are gone (they overlapped the servers); the balance flash and sparkles stay
 - Chip level at a glance: five small pips under every rack show the tier's chip level (one pip per chip family, four editions each, brighter with each edition; dark = no chip, all bright = level 20), and the Chip Upgrades card shows the same as small bars. They are static, so they cost no extra terminal output

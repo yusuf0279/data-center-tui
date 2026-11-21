@@ -9,9 +9,17 @@ A pixel-art idle tycoon for your terminal. Buy servers, hire Vibecoders, survive
 ## Install
 
 ```
-pipx install data-center-tui        # once it is on PyPI (or: pip install data-center-tui)
-data-center-tui
+pipx install build-a-hyperscaler        # or: pip install build-a-hyperscaler
+build-a-hyperscaler
 ```
+
+No Python tooling? The npm launcher runs the game through `uvx` or `pipx` (it needs one of them, or an installed `build-a-hyperscaler`):
+
+```
+npx build-a-hyperscaler
+```
+
+The package was renamed from `data-center-tui`. If you have the old one, `pip install -U data-center-tui` upgrades you: the new `data-center-tui` 0.2.0 is an empty stub that installs `build-a-hyperscaler` and keeps the old `data-center-tui` command working. Python code that did `import data_center_tui` must now `import build_a_hyperscaler`.
 
 From source:
 
@@ -19,14 +27,14 @@ From source:
 git clone https://github.com/yusuf0279/data-center-tui
 cd data-center-tui
 pip install .
-data-center-tui                      # or: python -m data_center_tui
+build-a-hyperscaler                  # or: python -m build_a_hyperscaler
 ```
 
 Needs Python 3.10 or newer and a terminal with colour; 100×30 or larger looks best (80×24 works, with a smaller hall). It plays fine inside tmux and uses the keyboard only.
 
 ```
-data-center-tui --no-online          # never contact the leaderboard server
-data-center-tui --save my.json       # use a different save file
+build-a-hyperscaler --no-online          # never contact the leaderboard server
+build-a-hyperscaler --save my.json       # use a different save file
 ```
 
 ## Controls
@@ -89,7 +97,7 @@ python -m unittest discover -s tests                         # the game (about 4
 python -m unittest discover -s server -p test_server.py      # the leaderboard server
 ```
 
-`data_center_tui/game.py` is the whole game, `server/` is the leaderboard server (see [`server/README.md`](server/README.md)), `tests/` holds the tests. The web port lives in `web/`; `npm run build` copies it into the VS Code extension (`vscode/media`) and the browser extensions (`browser/dist/chrome`, `browser/dist/firefox`), and `npm test` runs its Node tests.
+`build_a_hyperscaler/game.py` is the whole game, `server/` is the leaderboard server (see [`server/README.md`](server/README.md)), `tests/` holds the tests. The web port lives in `web/`; `npm run build` copies it into the VS Code extension (`vscode/media`) and the browser extensions (`browser/dist/chrome`, `browser/dist/firefox`), and `npm test` runs its Node tests.
 
 What was verified headlessly: the build output, that both browser manifests parse and reference only files that exist in `browser/dist`, the extension CSP and host permission strings, `vsce package` producing a `.vsix`, and the web tests under `web/test/`. Not verified: loading the extensions in a real Chrome, Firefox or VS Code, rendering, and live requests to the leaderboard server from inside a webview or extension page. The extensions' leaderboard is opt-in and sends only name, Fame and number of data centers to `data-center.openexplorer.xyz`; clearing extension storage loses the leaderboard identity token.
 

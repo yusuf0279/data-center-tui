@@ -10,7 +10,7 @@ from collections.abc import AsyncIterator
 from typing import Any
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from data_center_tui import game  # noqa: E402
+from build_a_hyperscaler import game  # noqa: E402
 
 logging.getLogger("asyncio").setLevel(logging.ERROR)  # no "slow callback" noise from debug mode
 for var in ("TMUX", "TMUX_PANE"):

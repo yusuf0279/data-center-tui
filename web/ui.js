@@ -14,7 +14,7 @@
   const MAX_REPLY_CHARS = 1 << 16;
   const THEMES = ['gruvbox', 'dracula', 'nord', 'tokyo-night', 'solarized-dark',
     'solarized-light', 'catppuccin-mocha', 'vscode'];
-  // Same fixed hues as data_center_tui/game.py: a tier looks the same in every theme.
+  // Same fixed hues as build_a_hyperscaler/game.py: a tier looks the same in every theme.
   const TIER_HUES = [340, 140, 300, 95, 262, 32, 175, 55, 215, 8];
   const TIER_SATURATION = 0.72;
   const CREW_INITIALS = C.CREW_INITIALS;

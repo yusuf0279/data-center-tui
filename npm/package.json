@@ -1,0 +1,14 @@
+{
+  "name": "build-a-hyperscaler",
+  "version": "0.2.0",
+  "description": "Launcher for Build a Hyperscaler (My Data Center), a pixel-art idle tycoon for your terminal. Runs the Python game via uvx or pipx.",
+  "license": "MIT",
+  "bin": { "build-a-hyperscaler": "bin/launch.js" },
+  "files": ["bin/launch.js", "README.md", "LICENSE"],
+  "engines": { "node": ">=18" },
+  "scripts": { "test": "node --test test/*.test.js" },
+  "keywords": ["game", "idle", "tycoon", "tui", "terminal"],
+  "repository": { "type": "git", "url": "git+https://github.com/yusuf0279/data-center-tui.git", "directory": "npm" },
+  "homepage": "https://github.com/yusuf0279/data-center-tui#readme",
+  "bugs": { "url": "https://github.com/yusuf0279/data-center-tui/issues" }
+}

@@ -1,7 +1,10 @@
 name: Publish to PyPI
 
 # Runs when you publish a GitHub release. It uses PyPI "trusted publishing", so no token is
-# stored anywhere: on pypi.org add this repository and workflow under the project's publishing settings.
+# stored anywhere. PyPI needs a trusted publisher for EACH project name below, both pointing at
+# this repository, workflow `publish.yml` and environment `pypi`:
+#   - build-a-hyperscaler (the game; first publish needs a "pending publisher" since the project is new)
+#   - data-center-tui     (the code-free stub in shim/, upgrades old users; this project already has one)
 on:
   release:
     types: [published]
@@ -18,5 +21,25 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install build
-      - run: python -m build
+      - run: python -m build --outdir dist .
       - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
+
+  pypi-shim:
+    # Published after the game, because the stub depends on it.
+    needs: pypi
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install build
+      - run: python -m build --outdir shim-dist shim
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: shim-dist

@@ -1,4 +1,4 @@
-/* My Data Center - game model. Port of data_center_tui/game.py (no DOM access).
+/* My Data Center - game model. Port of build_a_hyperscaler/game.py (no DOM access).
  * Works as a classic <script> (window.DCCore) and as CommonJS.
  * All money maths is exact BigInt; Numbers are only used for tiny values. */
 (function (root, factory) {
@@ -8,7 +8,7 @@
   'use strict';
 
   // ---------------------------------------------------------------- game data
-  // Mirrors data_center_tui/game.py exactly.
+  // Mirrors build_a_hyperscaler/game.py exactly.
 
   // name, base cost, income/sec (for the first data center)
   const TIERS = [

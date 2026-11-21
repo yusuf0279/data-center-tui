@@ -35,7 +35,7 @@ be spoofed by connecting directly.
 ```
 DC_DB=/tmp/leaderboard.db PORT=8080 python3 leaderboard.py
 python3 -m unittest discover -s . -p test_server.py        # the tests
-DC_SERVER=http://127.0.0.1:8080 python3 -m data_center_tui   # (from the repo root) point the game at it
+DC_SERVER=http://127.0.0.1:8080 python3 -m build_a_hyperscaler   # (from the repo root) point the game at it
 ```
 
 ## Deploy (dokkt)

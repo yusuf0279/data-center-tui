@@ -37,7 +37,7 @@ Ask for the old one to be removed via the contact below.
 
 ## Turning it off
 
-`data-center-tui --no-online`, or set `DC_ONLINE=0`. With it off the game never makes a network request.
+`build-a-hyperscaler --no-online`, or set `DC_ONLINE=0`. With it off the game never makes a network request.
 If you decline the first-run question, nothing about you is ever sent. Opening the leaderboard view still downloads the public top list (a plain GET that carries no data from you, though the server and proxy see your IP address as for any request).
 
 ## Contact

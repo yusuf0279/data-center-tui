@@ -24,7 +24,7 @@ sys.path.insert(0, str(ROOT))
 os.environ["DC_ONLINE"] = "0"
 os.environ["DC_SAVE"] = str(Path(tempfile.mkdtemp()) / "save.json")
 
-from data_center_tui import game as dc  # noqa: E402  (needs the env setup above)
+from build_a_hyperscaler import game as dc  # noqa: E402  (needs the env setup above)
 
 COST_OWNED = [0, 1, 2, 24, 25, 50, 99, 100, 500, 3999, 4000]
 INCOME_OWNED = [0, 1, 2, 24, 25, 26, 49, 50, 99, 100, 199, 200, 300, 400, 500, 999, 1000,

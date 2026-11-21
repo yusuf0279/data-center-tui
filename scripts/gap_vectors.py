@@ -8,6 +8,7 @@ Run: python3 scripts/gap_vectors.py
 """
 import asyncio
 import itertools
+import importlib
 import json
 import math
 import os
@@ -20,6 +21,15 @@ from unittest import mock
 
 from gzjson import write_gz
 
+
+def import_game(root: Path) -> Any:
+    """Import `game` from the checkout at `root` (new name, or the old one in older commits)."""
+    name = "build_a_hyperscaler" if (root / "build_a_hyperscaler").is_dir() else "data_center_tui"
+    module = importlib.import_module(f"{name}.game")
+    assert Path(module.__file__).resolve().is_relative_to(root), module.__file__
+    return module
+
+
 HERE = Path(__file__).resolve().parent.parent
 PY_ROOT = Path(os.environ.get("DC_PY_ROOT", "/mnt/bigvolume/dc-e66"))
 OUT = HERE / "rust" / "core" / "tests" / "data" / "gap_vectors.json.gz"
@@ -27,9 +37,8 @@ sys.path.insert(0, str(PY_ROOT))
 os.environ["DC_ONLINE"] = "0"
 os.environ["DC_SAVE"] = str(Path(tempfile.mkdtemp()) / "save.json")
 
-from data_center_tui import game as dc  # noqa: E402
+dc = import_game(PY_ROOT)  # noqa: E402
 
-assert Path(dc.__file__).resolve().is_relative_to(PY_ROOT), dc.__file__
 
 NROLES = len(dc.STAFF)
 NTIERS = len(dc.TIERS)

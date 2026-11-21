@@ -3,7 +3,7 @@ requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "data-center-tui"
+name = "build-a-hyperscaler"
 dynamic = ["version"]
 description = "A pixel-art idle tycoon for your terminal: build servers, hire Vibecoders, survive crises, relocate forever."
 readme = "README.md"
@@ -33,10 +33,10 @@ Issues = "https://github.com/yusuf0279/data-center-tui/issues"
 Privacy = "https://github.com/yusuf0279/data-center-tui/blob/main/PRIVACY.md"
 
 [project.scripts]
-data-center-tui = "data_center_tui.game:main"
+build-a-hyperscaler = "build_a_hyperscaler.game:main"
 
 [tool.setuptools]
-packages = ["data_center_tui"]
+packages = ["build_a_hyperscaler"]
 
 [tool.setuptools.dynamic]
-version = { attr = "data_center_tui.__version__" }
+version = { attr = "build_a_hyperscaler.__version__" }

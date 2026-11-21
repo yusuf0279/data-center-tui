@@ -490,7 +490,7 @@ def _request(method: str, path: str, body: dict[str, Any] | None) -> tuple[int, 
         data = json.dumps(body).encode() if body is not None else None
         req = urllib.request.Request(
             SERVER + path, data=data, method=method,
-            headers={"Content-Type": "application/json", "User-Agent": f"data-center-tui/{__version__}"})
+            headers={"Content-Type": "application/json", "User-Agent": f"build-a-hyperscaler/{__version__}"})
         try:
             with urllib.request.urlopen(req, timeout=6) as resp:
                 status, raw = resp.status, read_within(resp, deadline)
@@ -2840,10 +2840,10 @@ class DataCenter(App):
 def main(argv: list[str] | None = None) -> None:
     global ONLINE, ANIM
     parser = argparse.ArgumentParser(
-        prog="data-center-tui", description="A pixel-art idle tycoon for your terminal.",
+        prog="build-a-hyperscaler", description="A pixel-art idle tycoon for your terminal.",
         epilog="Environment: DC_SAVE (save file), DC_ONLINE=0 (no online features), "
                "DC_SERVER (leaderboard server URL), DC_ANIM=0 (no animation), DC_ANIM_FPS (4-30, default 12).")
-    parser.add_argument("--version", action="version", version=f"data-center-tui {__version__}")
+    parser.add_argument("--version", action="version", version=f"build-a-hyperscaler {__version__}")
     parser.add_argument("--no-online", action="store_true",
                         help="never contact the leaderboard server (same as DC_ONLINE=0)")
     parser.add_argument("--no-anim", action="store_true",

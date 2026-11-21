@@ -1,12 +1,18 @@
 import json
 import os
 import time
+from unittest import mock
 
 from helpers import AppCase, game, world_save
 
 
 class Basics(AppCase):
     async def test_fresh_game(self) -> None:
+        # The 1 s game tick pays income; under load it can fire mid-test and move the balance.
+        with mock.patch.object(game.DataCenter, "tick", lambda self: None):
+            await self._fresh_game()
+
+    async def _fresh_game(self) -> None:
         async with self.run_app() as (app, pilot):
             self.assertEqual((app.theme, app.balance, app.fame, app.sites, app.cur), ("gruvbox", 500, 0, 0, 0))
             self.assertTrue(app.autopilot)  # on for a brand-new game
@@ -68,12 +74,24 @@ class Relocation(AppCase):
             self.assertEqual(app.sites, 3)
 
     async def test_old_data_centers_are_decommissioned(self) -> None:
+        real_tick, manual = game.DataCenter.tick, []
+
+        def gated_tick(app: game.DataCenter) -> None:  # only the tick this test calls itself counts
+            if manual:
+                real_tick(app)
+
+        with mock.patch.object(game.DataCenter, "tick", gated_tick):
+            await self._old_data_centers(manual)
+
+    async def _old_data_centers(self, manual: list[bool]) -> None:
         async with self.run_app(world_save()) as (app, pilot):
             live_before, old_before = app.site_balance[2], app.site_balance[0]
             income = app.site_income(2)
             await pilot.press("d", "1")  # visit #1
             self.assertTrue(app.read_only)
+            manual.append(True)
             app.tick()
+            manual.clear()
             self.assertEqual(app.site_balance[2], live_before + income)  # the live one earned
             self.assertEqual(app.site_balance[0], old_before)  # the old one did not
             self.assertEqual(app.cur, 0)
@@ -115,6 +133,7 @@ class Crew(AppCase):
             self.assertGreater(app.owned[0], before)
             self.assertLessEqual(spent_from - app.balance, income * game.AUTO_BUYS_PER_TICK // game.AUTO_AFFORD_DIV)
 
+    @mock.patch.object(game.DataCenter, "tick", lambda self: None)  # a real tick would pay income mid-test
     async def test_autopilot_cannot_starve_a_poor_player(self) -> None:
         n = len(game.TIERS)
         poor = {"site_balance": [10**9], "site_owned": [[10] + [0] * (n - 1)], "site_chips": [[0] * n],

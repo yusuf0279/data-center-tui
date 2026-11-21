@@ -7,14 +7,25 @@ Each case is a save text plus the state Python ended up with. A text that Python
 Game root: $DC_PY_ROOT, default /mnt/bigvolume/dc-e66 (a worktree of the committed code).
 Run: python3 scripts/save_edge_oracle.py
 """
+import importlib
 import json
 import os
 import sys
 import tempfile
 from pathlib import Path
+from typing import Any
 from unittest import mock
 
 from gzjson import write_gz
+
+
+def import_game(root: Path) -> Any:
+    """Import `game` from the checkout at `root` (new name, or the old one in older commits)."""
+    name = "build_a_hyperscaler" if (root / "build_a_hyperscaler").is_dir() else "data_center_tui"
+    module = importlib.import_module(f"{name}.game")
+    assert Path(module.__file__).resolve().is_relative_to(root), module.__file__
+    return module
+
 
 HERE = Path(__file__).resolve().parent.parent
 ROOT = Path(os.environ.get("DC_PY_ROOT", "/mnt/bigvolume/dc-e66")).resolve()
@@ -22,9 +33,8 @@ OUT = HERE / "rust/core/tests/data/save_edge_oracle.json.gz"
 sys.path.insert(0, str(ROOT))
 os.environ["DC_ONLINE"] = "0"
 os.environ["DC_SAVE"] = str(Path(tempfile.mkdtemp()) / "save.json")
-from data_center_tui import game  # noqa: E402
+game = import_game(ROOT)  # noqa: E402
 
-assert Path(game.__file__).resolve().is_relative_to(ROOT), game.__file__
 NOW = 1_800_000_000.0
 BASE = '"sites": 2, "fame": 5, "theme": "nord"'
 
