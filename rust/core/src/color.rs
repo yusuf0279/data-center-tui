@@ -147,7 +147,7 @@ pub fn hls_bytes(hue_deg: f64, l: f64, s: f64) -> Rgb {
 pub fn chip_pips(level: i32) -> [i32; 5] {
     let mut out = [0; 5];
     for (i, p) in out.iter_mut().enumerate() {
-        *p = (level - CHIP_STEPS * i as i32).clamp(0, CHIP_STEPS);
+        *p = level.saturating_sub(CHIP_STEPS * i as i32).clamp(0, CHIP_STEPS);
     }
     out
 }

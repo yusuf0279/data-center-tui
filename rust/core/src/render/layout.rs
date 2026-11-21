@@ -1,6 +1,6 @@
 //! Hall layout: tier headers and rack rows laid end to end, which blocks are on screen,
 //! and the scroll rules. Pure functions with explicit inputs; a port of `Block`, `Layout`,
-//! `Hall.make_blocks`, `Hall.rack_layout` and `DataCenter.action_hall` (commit e66836d).
+//! `Hall.make_blocks`, `Hall.rack_layout` and `DataCenter.action_hall` (commit edf443e, with the crew margin).
 
 use crate::data::MAX_OWNED;
 
@@ -12,6 +12,10 @@ pub const CELL_H: usize = 8;
 pub const HEADER_LINES: usize = 1;
 /// Terminal lines per rack row.
 pub const RACK_LINES: usize = CELL_H / 2;
+/// A crew sprite: 5x6 pixels.
+pub const CREW_W: usize = 5;
+/// Pixel columns reserved right of the racks for the crew: the sprite plus a gap column.
+pub const CREW_MARGIN: usize = CREW_W + 1;
 
 /// What a block of the hall is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -72,6 +76,8 @@ pub struct Layout {
     pub total_rows: usize,
     pub tier_block: Vec<i64>,
     pub tier_first: Vec<usize>,
+    /// Pixel columns kept free right of the racks for the crew sprites.
+    pub reserve: usize,
 }
 
 /// A scroll key of the hall.
@@ -115,24 +121,35 @@ pub fn make_blocks(owned: &[u64], cols: usize) -> Blocks {
 }
 
 /// Place the hall in a `width` x `height` view and pick the visible blocks. `scroll` is the
-/// player's block number; `None` follows the newest racks at the bottom. Rack counts above
+/// player's block number; `None` follows the newest racks at the bottom. `staff` holds the
+/// training level per tier (-1: not hired): once somebody who owns racks is hired a right
+/// margin holds the crew, unless the hall is too narrow for a rack beside it. Rack counts above
 /// `MAX_OWNED` (a value no save or game can hold) are clamped to it, so an out-of-domain
 /// view cannot ask for gigabytes of picture.
-pub fn rack_layout(owned: &[u64], width: usize, height: usize, scroll: Option<usize>) -> Layout {
+pub fn rack_layout(owned: &[u64], staff: &[i32], width: usize, height: usize,
+                   scroll: Option<usize>) -> Layout {
     let owned: Vec<u64> = owned.iter().map(|&n| n.min(u64::from(MAX_OWNED))).collect();
     let owned = owned.as_slice();
     let height = height.max(HEADER_LINES + RACK_LINES);
-    let mut cols = (width / CELL_W).max(1);
+    let hired = owned.iter().zip(staff).any(|(&n, &s)| s >= 0 && n > 0);
+    let mut reserve = if hired { CREW_MARGIN } else { 0 };
+    if width < reserve + CELL_W {
+        reserve = 0;
+    }
+    let mut cols = (width.saturating_sub(reserve) / CELL_W).max(1);
     let mut b = make_blocks(owned, cols);
     if b.total_lines > height {
         // a scrollbar needs one column of its own
-        cols = (width.saturating_sub(1) / CELL_W).max(1);
+        if reserve > 0 && width < reserve + 1 + CELL_W {
+            reserve = 0; // no room for rack + margin + bar
+        }
+        cols = (width.saturating_sub(reserve + 1) / CELL_W).max(1);
         b = make_blocks(owned, cols);
     }
     let total_rows = b.blocks.iter().filter(|x| x.kind == Kind::Rack).count();
     let mut lay = Layout { cols, height, blocks: b.blocks, start: 0, end: 0,
                            total_lines: b.total_lines, total_rows,
-                           tier_block: b.tier_block, tier_first: b.tier_first };
+                           tier_block: b.tier_block, tier_first: b.tier_first, reserve };
     lay.start = scroll.map_or(lay.max_start(), |s| s.min(lay.max_start()));
     lay.end = lay.start;
     let mut used = 0;
@@ -151,6 +168,16 @@ impl Layout {
     /// Does the hall need scrolling?
     pub fn scrolled(&self) -> bool {
         self.total_lines > self.height
+    }
+
+    /// Pixels across the whole picture: the racks plus the crew margin.
+    pub fn grid_w(&self) -> usize {
+        self.cols * CELL_W + self.reserve
+    }
+
+    /// Left pixel column of the crew sprites (the last rack's gap column is their gap).
+    pub fn crew_x(&self) -> usize {
+        self.cols * CELL_W
     }
 
     /// Terminal line of the first visible block (0 for an empty hall).
@@ -215,7 +242,7 @@ mod tests {
 
     #[test]
     fn empty_hall() {
-        let lay = rack_layout(&[0; 10], 80, 24, None);
+        let lay = rack_layout(&[0; 10], &[-1; 10], 80, 24, None);
         assert!(lay.blocks.is_empty());
         assert_eq!((lay.start, lay.end, lay.max_start(), lay.used(), lay.top_line()), (0, 0, 0, 0, 0));
         assert_eq!(lay.tier_block, vec![-1; 10]);
@@ -232,13 +259,13 @@ mod tests {
 
     #[test]
     fn follow_and_scroll_keys() {
-        let lay = rack_layout(&[30, 20], 80, 10, None);
+        let lay = rack_layout(&[30, 20], &[-1; 10], 80, 10, None);
         assert_eq!(lay.start, lay.max_start());
         assert_eq!(lay.scroll_target(ScrollKey::End), None);
         let up = lay.scroll_target(ScrollKey::Up).expect("scrolled off the end");
         assert_eq!(up, lay.start - 1);
         assert_eq!(lay.scroll_target(ScrollKey::Home), Some(0));
-        let top = rack_layout(&[30, 20], 80, 10, Some(0));
+        let top = rack_layout(&[30, 20], &[-1; 10], 80, 10, Some(0));
         assert_eq!(top.scroll_target(ScrollKey::Up), Some(0));
         assert_eq!(top.rack_xy(0, 0), Some((0, 3))); // under the header line: (1 - 0) * 2 + 1
         assert_eq!(top.rack_xy(0, 5), None);

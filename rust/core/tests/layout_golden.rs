@@ -1,6 +1,7 @@
-//! Exact comparison of `render::layout` with every case of render_golden.json (864 cases,
-//! including the 50 whose `cells` are null because the committed game raised IndexError
-//! while drawing: those cases still record a valid layout, so they are covered here).
+//! Exact comparison of `render::layout` with every case of render_golden.json (all of them,
+//! including those whose `cells` are null because the committed game raised IndexError
+//! while drawing: those cases still record a valid layout, so they are covered here). The
+//! crew margin (`reserve`, `grid_w`, `crew_x`) and its narrow-width guards are compared too.
 //!
 //! Blocks are compared structurally when the golden holds them (<= 300 blocks); for larger
 //! halls the golden has only blocks_n, blocks_visible and the sha256 of Python's
@@ -84,18 +85,19 @@ fn sha256_hex(data: &[u8]) -> String {
     h.iter().map(|x| format!("{x:08x}")).collect()
 }
 
-/// The Hall widget size of a case. Normal cases force params w x h. The two `xcheck`
-/// (compositor) cases ran in a real 110x32 screen, so the Hall is smaller than params say;
-/// there the golden does not record the width, so it is recovered from `cols` (the width is
-/// cols*7, plus the scrollbar column when the hall scrolls) and only `height` is taken from
-/// the golden. Every other field is still checked independently.
+/// The Hall widget size of a case. Normal cases force params w x h. The `xcheck` (compositor)
+/// cases ran in a real 110x32 screen, so the Hall is smaller than params say; they record
+/// the real widget size as `hall_w` x `hall_h`.
 fn view_size(c: &Value) -> (usize, usize) {
-    let (p, l) = (&c["params"], &c["layout"]);
+    let p = &c["params"];
     if p.get("xcheck").is_none() {
         return (u(&p["w"]), u(&p["h"]));
     }
-    let bar = usize::from(l["scrolled"].as_bool().unwrap());
-    (u(&l["cols"]) * CELL_W + bar, u(&l["height"]))
+    (u(&p["hall_w"]), u(&p["hall_h"]))
+}
+
+fn staff_of(p: &Value) -> Vec<i32> {
+    p["staff"].as_array().unwrap().iter().map(|x| x.as_i64().unwrap() as i32).collect()
 }
 
 #[test]
@@ -108,17 +110,22 @@ fn sha256_known_answer() {
 fn layout_matches_every_case() {
     let g = golden();
     let cases = g["cases"].as_array().expect("cases");
-    let (mut full, mut hashed, mut null_cells) = (0, 0, 0);
+    let (mut full, mut hashed, mut null_cells, mut reserved, mut dropped) = (0, 0, 0, 0, 0);
     for (i, c) in cases.iter().enumerate() {
         let (p, l) = (&c["params"], &c["layout"]);
         let owned: Vec<u64> = p["owned"].as_array().unwrap().iter()
             .map(|x| x.as_u64().unwrap()).collect();
         let scroll = p["scroll"].as_u64().map(|s| s as usize);
         let (w, h) = view_size(c);
-        let lay = rack_layout(&owned, w, h, scroll);
+        let lay = rack_layout(&owned, &staff_of(p), w, h, scroll);
         let ctx = format!("case {i} {} {}x{} scroll {:?}", p["state"], p["w"], p["h"], scroll);
         assert_eq!(lay.cols, u(&l["cols"]), "{ctx} cols");
         assert_eq!(lay.height, u(&l["height"]), "{ctx} height");
+        assert_eq!(lay.reserve, u(&l["reserve"]), "{ctx} reserve");
+        assert_eq!(lay.grid_w(), u(&l["grid_w"]), "{ctx} grid_w");
+        assert_eq!(lay.crew_x(), u(&l["crew_x"]), "{ctx} crew_x");
+        reserved += usize::from(lay.reserve > 0);
+        dropped += usize::from(lay.reserve == 0 && staff_of(p).iter().zip(&owned).any(|(&s, &n)| s >= 0 && n > 0));
         assert_eq!(lay.start, u(&l["start"]), "{ctx} start");
         assert_eq!(lay.end, u(&l["end"]), "{ctx} end");
         assert_eq!(lay.total_lines, u(&l["total_lines"]), "{ctx} total_lines");
@@ -150,7 +157,9 @@ fn layout_matches_every_case() {
         null_cells += usize::from(c["cells"].is_null());
     }
     println!("layout: {} cases exact ({full} with full blocks, {hashed} sha256-checked, \
-              {null_cells} with cells=null still covered)", cases.len());
+              {null_cells} with cells=null still covered; {reserved} with a crew margin, \
+              {dropped} hired halls too narrow for one)", cases.len());
+    assert!(reserved > 300 && dropped > 20, "coverage {reserved} {dropped}");
 }
 
 #[test]
@@ -162,7 +171,7 @@ fn rack_xy_consistent_with_blocks() {
         let owned: Vec<u64> = p["owned"].as_array().unwrap().iter()
             .map(|x| x.as_u64().unwrap()).collect();
         let (w, h) = view_size(c);
-        let lay = rack_layout(&owned, w, h, p["scroll"].as_u64().map(|s| s as usize));
+        let lay = rack_layout(&owned, &staff_of(p), w, h, p["scroll"].as_u64().map(|s| s as usize));
         for b in &lay.blocks[lay.start..lay.end] {
             for k in 0..b.count {
                 let xy = lay.rack_xy(b.first + k, b.tier).expect("visible rack has a position");

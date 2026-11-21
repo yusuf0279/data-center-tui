@@ -18,6 +18,20 @@ pub const SPRITES: [[&str; 6]; 10] = [
     [".cccc.", "chddhc", "cdAAdc", "chddhc", ".cccc.", "..dd.."],
 ];
 
+/// Crew frames (a hat, s skin, c tier colour, d legs): idle0, idle1, work (arms up). The idle
+/// bob differs from the first frame in the two body rows only: one text line.
+pub const CREW_FRAMES: [[&str; 6]; 3] = [
+    [".aaa.", ".sss.", "ccccc", ".ccc.", ".d.d.", "dd.dd"],
+    [".aaa.", ".sss.", ".ccc.", "ccccc", ".d.d.", "dd.dd"],
+    ["caaac", "csssc", ".ccc.", ".ccc.", ".d.d.", "dd.dd"],
+];
+/// Index of the arms-up frame in [`CREW_FRAMES`].
+pub const CREW_WORK: usize = 2;
+
+/// The delivery truck, facing left (c cargo in the tier colour, h highlight, k cab, w window,
+/// d wheels).
+pub const TRUCK: [&str; 5] = ["..ccccccc", "kkkcchhcc", "kwkcccccc", "kkkkkkkkk", ".dd...dd."];
+
 /// Seconds an LED keeps one on/off roll.
 pub const LED_SLOT_S: f64 = 0.6;
 /// Fraction of a slot over which an LED fades to its new state.
@@ -61,12 +75,14 @@ pub fn led_lit(idx: usize, y: usize, x: usize) -> bool {
 }
 
 /// LED brightness 0..1 at time `t`: it re-rolls on/off once per slot (own offset) and eases.
+/// The slot number saturates for absurd (finite) `t` and the step before it wraps instead of
+/// overflowing; in-domain times behave exactly as the Python game.
 pub fn led_level(idx: usize, y: usize, x: usize, t: f64) -> f64 {
     let (idx, key) = (idx as i64, (y * 8 + x) as i64);
     let s = t / LED_SLOT_S + f64::from(mix32(&[idx, key, 99]) & 1023) / 1024.0;
     let k = s.floor();
     let roll = |n: i64| if mix32(&[idx, key, n]) % 5 < 2 { 1.0 } else { 0.0 };
-    let (now, before) = (roll(k as i64), roll(k as i64 - 1));
+    let (now, before) = (roll(k as i64), roll((k as i64).wrapping_sub(1)));
     before + (now - before) * smoothstep((s - k) / LED_FADE)
 }
 
@@ -92,6 +108,21 @@ mod tests {
         assert_eq!(smoothstep(2.0), 1.0);
         assert_eq!(ease_out(0.0), 0.0);
         assert_eq!(sine01(0.0, 3.0), 0.0);
+    }
+
+    #[test]
+    fn led_level_survives_absurd_times() {
+        for t in [1e300, -1e300, f64::MAX, f64::MIN, 1e19, -1e19] {
+            let v = led_level(3, 2, 5, t);
+            assert!(v.is_nan() || (0.0..=1.0).contains(&v), "{t} -> {v}");
+        }
+        assert_eq!(led_level(3, 2, 5, 12.5), led_level(3, 2, 5, 12.5));
+    }
+
+    #[test]
+    fn crew_and_truck_shapes() {
+        assert!(CREW_FRAMES.iter().all(|f| f.iter().all(|r| r.chars().count() == 5)));
+        assert!(TRUCK.iter().all(|r| r.chars().count() == 9));
     }
 
     #[test]
